@@ -1,36 +1,105 @@
-name: Deploy website
-
-# Publishes site/ to GitHub Pages. One-time repo setup:
-#   Settings → Pages → Build and deployment → Source: "GitHub Actions".
-# Custom domain later: add site/CNAME with the bare domain, point DNS
-# (A/AAAA to GitHub Pages IPs or CNAME to <org>.github.io), done.
+name: Fetch benchmark candidate validation
 
 on:
   push:
-    branches: [main]
-    paths: ['site/**', '.github/workflows/site.yml']
+    branches: [validation/fetch-empty-rows-20261010-v2]
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: colibri-fetch-candidate-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  validate:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    timeout-minutes: 35
+    env:
+      APP_SHA: 97f6584a15ca0d20a9551a472187daffad034cbc
+      BASE_SHA: 1509ea5be15def938f4158e012259f49e7a123b9
+      PYTHONUTF8: '1'
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      MAKEFLAGS: '-j2'
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
         with:
-          path: site
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          ref: 97f6584a15ca0d20a9551a472187daffad034cbc
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify application identity and CI-only child tree
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APP_SHA"
+          git merge-base --is-ancestor "$APP_SHA" "$GITHUB_SHA"
+          test "$(git rev-parse "$GITHUB_SHA^")" = "$APP_SHA"
+          test "$(git diff --name-only "$APP_SHA" "$GITHUB_SHA")" = '.github/workflows/site.yml'
+          git diff --exit-code "$APP_SHA" "$GITHUB_SHA" -- . ':(exclude).github/workflows/site.yml'
+          git diff --check "$BASE_SHA" "$APP_SHA"
+          printf 'APP_SHA=%s\nBASE_SHA=%s\nCI_SHA=%s\n' "$APP_SHA" "$BASE_SHA" "$GITHUB_SHA" > identities.log
+          python --version >> identities.log
+          gcc --version >> identities.log
+      - name: Original producer must reproduce exactly four empty-publication failures
+        run: |
+          python - <<'PY'
+          import pathlib, re, subprocess
+          path = pathlib.Path('c/tools/fetch_benchmarks.py')
+          fixed = path.read_bytes()
+          try:
+              path.write_bytes(subprocess.check_output(['git', 'show',
+                  '1509ea5be15def938f4158e012259f49e7a123b9:c/tools/fetch_benchmarks.py']))
+              result = subprocess.run(['python', 'c/tests/test_fetch_benchmarks.py'],
+                  capture_output=True, text=True, timeout=60)
+              output = result.stdout + result.stderr
+              pathlib.Path('baseline.log').write_text(output, encoding='utf-8')
+              assert result.returncode == 1, output
+              assert re.search(r'Ran 3 tests in ', output), output
+              assert 'FAILED (failures=4)' in output, output
+              assert output.count('AssertionError: 0 != 1') == 4, output
+              assert not re.search(r'^ERROR:', output, re.MULTILINE), output
+          finally:
+              path.write_bytes(fixed)
+          PY
+          git diff --exit-code "$APP_SHA" -- c/tools/fetch_benchmarks.py c/tests/test_fetch_benchmarks.py
+      - name: Fixed public CLI and existing evaluation controls
+        run: |
+          set -euo pipefail
+          python c/tests/test_fetch_benchmarks.py 2>&1 | tee fixed-fetch.log
+          python c/tests/test_eval_glm.py 2>&1 | tee fixed-eval.log
+          python -m py_compile c/tools/fetch_benchmarks.py c/tests/test_fetch_benchmarks.py
+      - name: Required clean portable build, C suites, and Python stdlib suites
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          make -C c check 2>&1 | tee make-check.log
+          python - <<'PY'
+          import pathlib, re
+          output = pathlib.Path('make-check.log').read_text(encoding='utf-8')
+          assert not re.search(r'(^|:)\s*warning:', output, re.MULTILINE), 'Compiler warning in make check'
+          PY
+      - name: Install upstream CPU oracle requirements and record resolved versions
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          python -m pip install -r c/tools/oracle-requirements.txt 2>&1 | tee oracle-install.log
+          python -m pip freeze > oracle-versions.log
+      - name: Generate host reference and enforce both strict oracle comparisons
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          cd c
+          python tools/make_glm_oracle.py 2>&1 | tee ../oracle-generation.log
+          SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16 2>&1 | tee ../oracle-tf.log
+          SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16 2>&1 | tee ../oracle-greedy.log
+          python tests/test_glm_oracle.py 2>&1 | tee ../oracle-regressions.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: colibri-fetch-validation-${{ github.run_id }}
+          path: '*.log'
+          retention-days: 3
