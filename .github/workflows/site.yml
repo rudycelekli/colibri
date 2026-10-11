@@ -1,36 +1,174 @@
-name: Deploy website
-
-# Publishes site/ to GitHub Pages. One-time repo setup:
-#   Settings → Pages → Build and deployment → Source: "GitHub Actions".
-# Custom domain later: add site/CNAME with the bare domain, point DNS
-# (A/AAAA to GitHub Pages IPs or CNAME to <org>.github.io), done.
+name: Model mirror verification candidate validation
 
 on:
   push:
-    branches: [main]
-    paths: ['site/**', '.github/workflows/site.yml']
+    branches: [validation/mirror-source-binding-20261010-v1]
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: colibri-mirror-candidate-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  validate:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    timeout-minutes: 35
+    env:
+      APP_SHA: 42bbfd8d57f271b6eef09aa1dce7cf6911a02dea
+      BASE_SHA: 1509ea5be15def938f4158e012259f49e7a123b9
+      PYTHONUTF8: '1'
+      MAKEFLAGS: '-j2'
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
         with:
-          path: site
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          ref: 42bbfd8d57f271b6eef09aa1dce7cf6911a02dea
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify application identity and CI-only child tree
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APP_SHA"
+          git merge-base --is-ancestor "$APP_SHA" "$GITHUB_SHA"
+          test "$(git rev-parse "$GITHUB_SHA^")" = "$APP_SHA"
+          test "$(git diff --name-only "$APP_SHA" "$GITHUB_SHA")" = '.github/workflows/site.yml'
+          git diff --exit-code "$APP_SHA" "$GITHUB_SHA" -- . ':(exclude).github/workflows/site.yml'
+          git diff --check "$BASE_SHA" "$APP_SHA"
+          printf 'APP_SHA=%s\nBASE_SHA=%s\nCI_SHA=%s\n' "$APP_SHA" "$BASE_SHA" "$GITHUB_SHA" > identities.log
+          python - <<'PY'
+          import hashlib, os, pathlib, subprocess
+          base = os.environ['BASE_SHA']
+          app = os.environ['APP_SHA']
+          changed = subprocess.check_output(['git', 'diff', '--name-only', base, app], text=True).splitlines()
+          assert set(changed) == {'c/tools/mirror_plan.py', 'c/tests/test_mirror_plan.py'} and len(changed) == 2, changed
+          def native_tree(sha):
+              rows = subprocess.check_output(['git', 'ls-tree', '-r', sha], text=True).splitlines()
+              return [row for row in rows if row.split('\t', 1)[1].endswith(('.c', '.h'))
+                  or pathlib.PurePosixPath(row.split('\t', 1)[1]).name in ('Makefile', 'GNUmakefile')]
+          original, fixed = native_tree(base), native_tree(app)
+          assert fixed == original, 'C/header/Makefile tree differs from baseline'
+          with pathlib.Path('identities.log').open('a', encoding='utf-8') as log:
+              log.write('Native source files=' + str(len(fixed)) + '\n')
+              log.write('Native tree SHA256=' + hashlib.sha256(('\n'.join(fixed)+'\n').encode()).hexdigest() + '\n')
+          PY
+          printf '*.log\n' >> .git/info/exclude
+          python --version >> identities.log
+          gcc --version >> identities.log
+      - name: Original verifier must reproduce exactly eight source-identity failures
+        run: |
+          python - <<'PY'
+          import os, pathlib, re, subprocess
+          path = pathlib.Path('c/tools/mirror_plan.py')
+          fixed = path.read_bytes()
+          try:
+              path.write_bytes(subprocess.check_output(['git', 'show',
+                  '1509ea5be15def938f4158e012259f49e7a123b9:c/tools/mirror_plan.py']))
+              result = subprocess.run(['python', 'c/tests/test_mirror_plan.py'],
+                  capture_output=True, text=True, timeout=60,
+                  env=dict(os.environ, PYTHONPATH="c"))
+              output = result.stdout + result.stderr
+              pathlib.Path('baseline.log').write_text(output, encoding='utf-8')
+              assert result.returncode == 1, output
+              assert re.search(r'Ran 18 tests in ', output), output
+              assert 'FAILED (failures=8)' in output, output
+              assert output.count('AssertionError: True is not false') == 4, output
+              assert output.count('AssertionError: MirrorError not raised') == 2, output
+              assert output.count('AssertionError: 0 != 4') == 2, output
+              assert not re.search(r'^ERROR:', output, re.MULTILINE), output
+              failures = re.findall(r'^FAIL: (\w+) ', output, re.MULTILINE)
+              expected = ['test_full_mirror_rejects_different_tensor_bytes_with_valid_header', 'test_partial_verify_rejects_changed_source_and_preserves_receipt_only_check', 'test_partial_verify_rejects_missing_source_shard', 'test_partial_verify_reports_source_discovery_errors', 'test_partial_verify_reports_source_discovery_errors', 'test_partial_verify_resolves_split_sources_and_primary_precedence', 'test_verify_cli_rejects_other_model_with_same_shard_name_and_size', 'test_verify_cli_rejects_other_model_with_same_shard_name_and_size']
+              assert sorted(failures) == sorted(expected), failures
+              assert "(source='missing directory')" in output, output
+              assert "(source='invalid header')" in output, output
+              assert "skipped=" not in output, output
+          finally:
+              path.write_bytes(fixed)
+          PY
+          test "$(git rev-parse HEAD)" = "$APP_SHA"
+          git diff --exit-code "$APP_SHA"
+          python - <<'PY'
+          import hashlib, pathlib
+          expected = {'c/tools/mirror_plan.py': '3ae7191d4fe3b873d002fefe9cab9a6a2684434e62e1b66e67f901f4c8a5fab6', 'c/tests/test_mirror_plan.py': '3b6bf41c5272d3793d0b9daf7b12692cda2a23038c099463fb7546d63828df3f'}
+          for name, digest in expected.items():
+              assert hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() == digest, name
+          PY
+      - name: Fixed public CLI and mirror family controls
+        run: |
+          set -euo pipefail
+          PYTHONPATH=c python c/tests/test_mirror_plan.py 2>&1 | tee fixed-mirror.log
+          python -m py_compile c/tools/mirror_plan.py c/tests/test_mirror_plan.py
+      - name: Required clean portable build, C suites, and Python stdlib suites
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          make -C c check 2>&1 | tee make-check.log
+          python - <<'PY'
+          import pathlib, re
+          output = pathlib.Path('make-check.log').read_text(encoding='utf-8')
+          lines = output.splitlines()
+          first = lines.index('make portable')
+          last = lines.index('make test', first)
+          portable = '\n'.join(lines[first:last])
+          assert not re.search(r'(^|:)\s*warning:', portable, re.MULTILINE), 'Warning in portable production engine build'
+          warning_indexes = [i for i, line in enumerate(lines)
+              if re.search(r'(^|:)\s*warning:', line)]
+          assert len(warning_indexes) <= 2, warning_indexes
+          expected = {'tests/test_deepseek_v4', 'tests/test_v4_serve_framing'}
+          observed = set()
+          for index in warning_indexes:
+              assert lines[index] == 'lto-wrapper: warning: using serial compilation of 2 LTRANS jobs', lines[index]
+              context = '\n'.join(lines[:index]).replace('\\\n', ' ')
+              links = [line for line in context.splitlines()
+                  if line.startswith('gcc ') and re.search(r'\s-o tests/', line) and 'COLI_V4_UNIT_' in line]
+              assert links, 'No compiler link context for diagnostic'
+              command = links[-1]
+              assert 'COLI_V4_UNIT_' in command, command
+              target = re.search(r'\s-o (tests/\S+)', command).group(1)
+              assert target in expected and target not in observed, command
+              observed.add(target)
+          assert observed <= expected, observed
+          pathlib.Path('warning-audit.log').write_text(
+              'Portable production engine: zero compiler warnings\n'
+              'Observed unchanged unit-link diagnostics: ' + str(len(warning_indexes)) + '\n'
+              + '\n'.join(lines[i] for i in warning_indexes) + '\n', encoding='utf-8')
+          PY
+      - name: Install upstream CPU oracle requirements and record resolved versions
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          python -m pip install -r c/tools/oracle-requirements.txt 2>&1 | tee oracle-install.log
+          python -m pip freeze > oracle-versions.log
+      - name: Generate host reference and enforce both strict oracle comparisons
+        timeout-minutes: 4
+        env:
+          OMP_NUM_THREADS: '2'
+          MKL_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          cd c
+          python tools/make_glm_oracle.py 2>&1 | tee ../oracle-generation.log
+          SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16 2>&1 | tee ../oracle-tf.log
+          SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16 2>&1 | tee ../oracle-greedy.log
+          python tests/test_glm_oracle.py 2>&1 | tee ../oracle-regressions.log
+      - name: Verify final application head, tracked tree, and source hashes
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APP_SHA"
+          git diff --exit-code "$APP_SHA"
+          python - <<'PY'
+          import hashlib, pathlib
+          expected = {'c/tools/mirror_plan.py': '3ae7191d4fe3b873d002fefe9cab9a6a2684434e62e1b66e67f901f4c8a5fab6', 'c/tests/test_mirror_plan.py': '3b6bf41c5272d3793d0b9daf7b12692cda2a23038c099463fb7546d63828df3f'}
+          for name, digest in expected.items():
+              assert hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() == digest, name
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: colibri-mirror-validation-${{ github.run_id }}
+          path: '*.log'
+          retention-days: 3
