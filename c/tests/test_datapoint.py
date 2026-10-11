@@ -333,6 +333,45 @@ class PersistentDatapointTest(unittest.TestCase):
 
 
 class FreshDatapointTest(unittest.TestCase):
+    def test_native_tune_timing_is_used_with_a_load_banner(self):
+        output = ("resident weights loaded in 1.0s | RSS after load: 2.00 GB\n"
+                  "TUNE decode: 128 tokens in 2.000s\n")
+        with mock.patch.object(datapoint.subprocess, "run", return_value=
+                               subprocess.CompletedProcess([], 0, output, "")), \
+             mock.patch.object(datapoint.time, "monotonic", side_effect=[0.0, 8.0]):
+            rows = datapoint.run_fresh_engine("olmoe", "/model", "prompt", 128, 1, 16, 8)
+        self.assertEqual(rows[0]["tokens"], 128)
+        self.assertEqual(rows[0]["gen_s"], 2.0)
+        self.assertEqual(rows[0]["tok_s"], 64.0)
+        self.assertEqual(rows[0]["request_s"], 7.0)
+        self.assertEqual(rows[0]["rss"], 2.0)
+
+    def test_legacy_load_banner_without_tune_keeps_wall_timing(self):
+        output = "resident weights loaded in 1.0s | RSS after load: 2.00 GB\n"
+        with mock.patch.object(datapoint.subprocess, "run", return_value=
+                               subprocess.CompletedProcess([], 0, output, "")), \
+             mock.patch.object(datapoint.time, "monotonic", side_effect=[0.0, 8.0]):
+            rows = datapoint.run_fresh_engine("olmoe", "/model", "prompt", 128, 1, 16, 8)
+        self.assertEqual(rows[0]["gen_s"], 7.0)
+        self.assertEqual(rows[0]["tokens"], 128)
+
+    @unittest.skipIf(os.name == "nt", "owned executable fixture uses a POSIX shebang")
+    def test_public_cli_uses_native_decode_time_instead_of_process_wall_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = Path(directory) / "olmoe"
+            engine.write_text(
+                f"#!{sys.executable}\nimport time\ntime.sleep(0.2)\n"
+                "print('resident weights loaded in 0.0s | RSS after load: 2.00 GB')\n"
+                "print('TUNE decode: 128 tokens in 0.010s')\n", encoding="utf-8")
+            engine.chmod(0o755)
+            result = subprocess.run(
+                [sys.executable, str(Path(datapoint.__file__)), "--mode", "fresh-process",
+                 "--engine", str(engine), "--snap", directory, "--max-new", "128",
+                 "--no-evict"], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("| 128 |"), 2)
+        self.assertEqual(result.stdout.count("| 12800.00 | n/a | 2.00 GB |"), 2)
+
     def test_qwen38_receives_a_temporary_prompt_file_and_exact_generation_cap(self):
         observed = {}
 

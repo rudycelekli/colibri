@@ -483,8 +483,11 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
             speed = QWEN38_SPEED_RE.search(output) if engine_name in ("qwen38", "qwen38.exe") else None
             if engine_name in ("qwen38", "qwen38.exe") and not speed:
                 sys.exit(f"could not parse Qwen3.8 generation count/speed:\n{output[-400:]}")
-            gen_s = float(speed.group(1)) if speed else wall - load_s
-            tok_count = int(speed.group(2)) if speed else max_new
+            tune = TUNE_RE.search(output)
+            gen_s = (float(speed.group(1)) if speed else
+                     float(tune.group(2)) if tune else wall - load_s)
+            tok_count = (int(speed.group(2)) if speed else
+                         int(tune.group(1)) if tune else max_new)
         else:
             # 2. Fallback parser for engines like deepseek_v4 that output TUNE decode / timing lines
             m_tune = TUNE_RE.search(output)
