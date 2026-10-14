@@ -98,7 +98,7 @@ typedef struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
-    VkShaderModule mod_gv2; VkPipeline gv2;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2) */
+    VkShaderModule mod_gv2; VkPipeline gv2; int gv2_floats;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2), x staged up to gv2_floats */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
@@ -337,6 +337,16 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
 static void dsv4_init(void);       /* chain_dsv4.comp (DeepSeek V4.1 / V4), below */
 static void dsv4_shutdown(void);
 static void kvs_shutdown(void);    /* chain_kvs.comp (the split KV cache), below */
+/* The compute shared memory a workgroup may declare: the device's
+ * maxComputeSharedMemorySize, or COLI_VK_SHARED_LIMIT (tests: Lavapipe reports 32 KiB of
+ * what is host memory, and the op tests run the 38 KiB full attention there). */
+static uint32_t kc_shared_limit(void) {
+    const char *e = getenv("COLI_VK_SHARED_LIMIT");
+    if (e && *e) return (uint32_t)strtoul(e, NULL, 10);
+    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+    return pp.limits.maxComputeSharedMemorySize;
+}
+
 int vkc_init(void) {
     if (KC.ready) return !KC.lost;
     if (!coli_vk_core_dev(g_kd, &KC.core)) return 0;
@@ -376,15 +386,29 @@ int vkc_init(void) {
         }
     }
     /* the int8/int4 decode GEMV with lanes per row and rows per workgroup chosen per
-     * matrix (chain_gemv2.comp): needs clustered subgroup operations */
+     * matrix (chain_gemv2.comp): needs clustered subgroup operations. Its x staging is
+     * sized from the device's shared memory as chain_gemv's is: a fixed 64 KiB lost the
+     * device on a 48 KiB GPU (#1998, a Quadro P2000), where it now stages 48 KiB and a
+     * matrix whose rows of x do not fit takes chain_gemv. */
     {
         const char *e = getenv("COLI_VK_CHAIN_GEMV2");
         VkPhysicalDeviceSubgroupProperties sgp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
         VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sgp};
         vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &p2);
+        int xs = (int)(kc_shared_limit() / 16);   /* vec4s */
+        if (xs > 4096) xs = 4096;
         int ok = (sgp.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) && (sgp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
-                 sgp.subgroupSize >= 16 && !(e && *e == '0');
-        if (ok && (KC.mod_gv2 = load_module(KC.core.spv_path, "chain_gemv2.spv"))) KC.gv2 = make_pipe(KC.mod_gv2, NULL);
+                 sgp.subgroupSize >= 16 && xs >= 256 && !(e && *e == '0');
+        if (ok && (KC.mod_gv2 = load_module(KC.core.spv_path, "chain_gemv2.spv"))) {
+            int32_t v = xs;
+            VkSpecializationMapEntry me = {0, 0, 4};
+            VkSpecializationInfo si = {1, &me, 4, &v};
+            if ((KC.gv2 = make_pipe(KC.mod_gv2, &si))) {
+                KC.gv2_floats = 4 * xs;
+                if (xs < 4096)
+                    fprintf(stderr, "[VK] chain: chain_gemv2 stages x in %d KiB of shared memory, the device's limit\n", xs / 64);
+            }
+        }
     }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
@@ -796,12 +820,12 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
              (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (ti->rowWords / 4) * per / 4 <= KC.gemv4_xs;
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
     int g2 = path < 0 && KC.gv2 && S <= 4 && ti->fmt == 1 &&   /* int4 measured slower than chain_gemv here */
-             ti->I % 32 == 0 && ti->I <= 16384 && ti->rowWords % 4 == 0;
+             ti->I % 32 == 0 && ti->I <= KC.gv2_floats && ti->rowWords % 4 == 0;
     if (g2) {
         /* rows a workgroup: short matrices in small blocks, so they still fill the device */
         int rpw = ti->O <= 1024 ? 16 : ti->O <= 4096 ? 32 : 64;
         /* a speculative verify's rows (S <= 4) share each weight load */
-        int nr = S <= 4 && S * ti->I <= 16384 ? S : 1;
+        int nr = S <= 4 && S * ti->I <= KC.gv2_floats ? S : 1;
         struct { int fmt, S, I, O, rowWords, gs, rpw, nr; } pc8 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, rpw, nr};
         ok = record(KC.gv2, bd, 4, &pc8, sizeof pc8, (uint32_t)((ti->O + rpw - 1) / rpw), (uint32_t)((S + nr - 1) / nr), 1);
     }
@@ -1423,12 +1447,23 @@ static void kf_shutdown(void) {
     if (KF.cmod) vkDestroyShaderModule(KC.dev, KF.cmod, NULL);
     memset(&KF, 0, sizeof KF);
 }
+/* chain_attn_full.comp's shared arrays have a fixed size: a device with less shared
+ * memory declines the op (the CPU runs it) instead of getting an invalid pipeline, as
+ * chain_gemv2 did on a 48 KiB GPU (#1998). tests/test_vk_shared_memory.py holds this
+ * number to the compiled shader's. */
+#define ATTN_FULL_SHARED 38912u
+static void kf_load(void) {
+    if (KF.mod || KF.tried) return;
+    KF.tried = 1;
+    if (kc_shared_limit() < ATTN_FULL_SHARED) return;
+    KF.mod = load_module(KC.core.spv_path, "chain_attn_full.spv");
+}
 int vkc_attn_full(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p) {
     if (!vkc_ready() || p->S < 1 || p->T < 1 || p->H < 1 || (p->hd != 32 && p->hd != 64 && p->hd != 128) ||
         (int64_t)p->S > 65535LL * 64 || p->H > 65535) return 0;
     int k = p->hd == 32 ? 0 : p->hd == 64 ? 1 : 2;
     if (!KF.pipe[k]) {
-        if (!KF.mod && !KF.tried) { KF.tried = 1; KF.mod = load_module(KC.core.spv_path, "chain_attn_full.spv"); }
+        kf_load();
         if (!KF.mod) return 0;
         int hd = p->hd;
         VkSpecializationMapEntry me = {0, 0, sizeof(int)};
@@ -1476,7 +1511,7 @@ int vkc_attn_full_coop(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p) {
 int vkc_attn_full_coop_ready(int hd) { return vkc_ready() && kf_coop_pipe(hd) != VK_NULL_HANDLE; }
 int vkc_attn_full_ready(void) {
     if (!vkc_ready()) return 0;
-    if (!KF.mod && !KF.tried) { KF.tried = 1; KF.mod = load_module(KC.core.spv_path, "chain_attn_full.spv"); }
+    kf_load();
     return KF.mod != VK_NULL_HANDLE;
 }
 

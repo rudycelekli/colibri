@@ -618,6 +618,35 @@ class RunConfiguration(HomeTestCase):
         self.assertEqual(args[args.index("--gpu") + 1], "auto")
         self.assertNotIn("--gpu", setup_flow.launcher_args("vulkan", "/m", "127.0.0.1", 8000))
 
+    def test_every_backend_applies_the_plan(self):
+        # #2003: a Vulkan or CPU setup recorded no --auto-tier, and the families whose
+        # implicit cap is 8 ran 8 expert slots a layer whatever the printed plan said
+        for backend in ("cuda", "vulkan", "cpu"):
+            for family in ("qwen36", "qwen38", "kimi", "inkling", "deepseek_v4", "deepseek_v41", "mimo"):
+                with self.subTest(backend=backend, family=family):
+                    self.assertIn("--auto-tier", setup_flow.launcher_args(
+                        backend, "/m", "127.0.0.1", 8000, family=family_by_id(family)))
+        # the GLM engines and OLMoE size their cache themselves off CUDA, as before
+        for family in ("glm", "glm53", "olmoe"):
+            with self.subTest(family=family):
+                self.assertNotIn("--auto-tier", setup_flow.launcher_args(
+                    "vulkan", "/m", "127.0.0.1", 8000, family=family_by_id(family)))
+                self.assertIn("--auto-tier", setup_flow.launcher_args(
+                    "cuda", "/m", "127.0.0.1", 8000, family=family_by_id(family)))
+
+    def test_ctx_is_recorded_and_checked(self):
+        # #2011: `coli setup --ctx N` is kept for `coli start`, and a context the family
+        # cannot hold stops the setup before anything is built
+        args = setup_flow.launcher_args("vulkan", "/m", "127.0.0.1", 8000, 32768)
+        self.assertEqual(args[args.index("--ctx") + 1], "32768")
+        self.assertNotIn("--ctx", setup_flow.launcher_args("vulkan", "/m", "127.0.0.1", 8000))
+        qwen36 = family_by_id("qwen36")
+        setup_flow.check_ctx(0, qwen36)
+        setup_flow.check_ctx(qwen36.limits.max_context, qwen36)
+        for bad in (-1, qwen36.limits.max_context + 1):
+            with self.subTest(ctx=bad), self.assertRaises(setup_flow.SetupError):
+                setup_flow.check_ctx(bad, qwen36)
+
     def test_written_and_read_back(self):
         entry = setup_catalog.by_id("qwen36-35b")
         engine_info = {"launcher_dir": str(C_DIR), "engine": str(C_DIR / "qwen36"),
@@ -1381,7 +1410,7 @@ class ServerControl(HomeTestCase):
         self.env_out = os.path.join(self.tmp.name, "env.json")
         self.port = free_port()
         self.cfg = setup_flow.save_config({
-            "status": "ready", "model": {"name": "Fake"}, "model_dir": self.tmp.name,
+            "status": "ready", "model": {"name": "Fake"}, "model_dir": self.tmp.name, "family": "qwen36",
             "launcher": self.launcher, "engine": self.launcher, "backend": "vulkan",
             "env": {"COLI_VULKAN": "1", "EXTRA": "from-config"},
             "args": ["web", "--model", self.tmp.name, "--host", "127.0.0.1", "--port", str(self.port)],
@@ -1427,6 +1456,7 @@ class ServerControl(HomeTestCase):
         self.assertEqual(seen["COLI_VULKAN"], "1")
         self.assertEqual(seen["EXTRA"], "from-user")             # the user's own environment wins
         self.assertIn("--no-browser", seen["argv"])
+        self.assertIn("--auto-tier", seen["argv"])   # a setup recorded before #2003 applies its plan too
         self.assertTrue(os.path.exists(setup_flow.log_path("serve")))
         # Starting twice does not start a second server.
         again = setup_flow.start_server(self.cfg, background=True, open_browser=False,
@@ -1614,7 +1644,7 @@ class CommandLine(HomeTestCase):
         result = self.coli("setup", "--help")
         self.assertEqual(result.returncode, 0)
         for flag in ("--yes", "--model", "--model-dir", "--dir", "--backend", "--no-gpu",
-                     "--background", "--no-start", "--via-windows", "--json"):
+                     "--background", "--no-start", "--via-windows", "--json", "--ctx"):
             self.assertIn(flag, result.stdout)
 
     def test_start_before_setup_says_what_to_do(self):

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -112,19 +113,21 @@ class ChatContextTest(unittest.TestCase):
         self.model = self.tmp.name
 
     def test_the_step_follows_the_memory(self):
-        # 40 KiB a token: 16384 is 0.67 GB, 32768 1.34 GB, 65536 2.68 GB
-        for available, expected in ((4 * GB, None), (8 * GB, 16384), (16 * GB, 32768),
-                                    (32 * GB, 65536), (512 * GB, 65536)):
+        # 40 KiB a token: 16384 is 0.67 GB, 32768 1.34 GB, 65536 2.68 GB (up to a quarter of
+        # the memory, what agents need), 131072 5.37 GB and 262144 10.7 GB (a tenth)
+        for available, expected in ((2 * GB, None), (4 * GB, 16384), (8 * GB, 32768),
+                                    (16 * GB, 65536), (32 * GB, 65536), (64 * GB, 131072),
+                                    (512 * GB, 262144)):
             with self.subTest(gb=available / GB):
                 context, _why = chat_context(self.model, {}, available=available)
                 self.assertEqual(context, expected)
 
     def test_every_kv_slot_holds_its_own(self):
         context, _ = chat_context(self.model, {}, kv_slots=4, available=32 * GB)
-        self.assertEqual(context, 16384)
+        self.assertEqual(context, 32768)
 
     def test_ram_gb_is_the_budget_and_a_set_context_stays(self):
-        self.assertEqual(chat_context(self.model, {"RAM_GB": "16"}, available=512 * GB)[0], 32768)
+        self.assertEqual(chat_context(self.model, {"RAM_GB": "16"}, available=512 * GB)[0], 65536)
         context, why = chat_context(self.model, {"Q36_MAXT": "4096"}, available=512 * GB)
         self.assertIsNone(context)
         self.assertIn("Q36_MAXT", why)
@@ -133,10 +136,50 @@ class ChatContextTest(unittest.TestCase):
         from family_registry import resolve_model
         family = resolve_model(self.model).descriptor
         env = {"RAM_GB": "16"}
-        self.assertEqual(gateway.chat_context_env(env, family, self.model), 32768)
-        self.assertEqual(env["Q36_MAXT"], "32768")
+        self.assertEqual(gateway.chat_context_env(env, family, self.model), 65536)
+        self.assertEqual(env["Q36_MAXT"], "65536")
         env = {"Q36_MAXT": "12000"}
         self.assertEqual(gateway.chat_context_env(env, family, self.model), 12000)
+
+
+
+class ResponseCeilingTest(unittest.TestCase):
+    """#382: with no ceiling from the operator (--max-tokens 0, what coli serve, web and
+    chat pass without --ngen) a response may run to the end of the context the engine
+    holds: a reasoning model's turn is its reasoning plus its answer, and a fixed number
+    below the context cut some of them short."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        (Path(self.tmp.name) / "config.json").write_text(json.dumps(QWEN36_35B_CONFIG))
+        self.model = self.tmp.name
+
+    def start(self, max_tokens, env):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_openai_server import FakeProcess
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process) as popen:
+            engine = gateway.Engine("qwen36", self.model, max_tokens=max_tokens, env=env)
+        self.addCleanup(engine.close)
+        return engine, popen.call_args.kwargs["env"]
+
+    def test_no_ceiling_is_the_context_the_memory_gives(self):
+        engine, env = self.start(0, {"RAM_GB": "16"})
+        self.assertEqual(engine.context_limit, 65536)
+        self.assertEqual((engine.max_tokens, env["NGEN"]), (65536, "65536"))
+
+    def test_no_ceiling_is_a_context_the_operator_set(self):
+        engine, env = self.start(0, {"Q36_MAXT": "12000"})
+        self.assertEqual((engine.max_tokens, env["NGEN"]), (12000, "12000"))
+
+    def test_an_operator_ceiling_stays(self):
+        engine, env = self.start(300, {"RAM_GB": "16"})
+        self.assertEqual((engine.max_tokens, env["NGEN"]), (300, "300"))
+
+    def test_a_request_without_max_tokens_gets_the_ceiling(self):
+        self.assertEqual(gateway.generation_options({}, 65536)[0], 65536)
+        self.assertEqual(gateway.generation_options({"max_tokens": 900000}, 65536)[0], 65536)
 
 
 if __name__ == "__main__":
