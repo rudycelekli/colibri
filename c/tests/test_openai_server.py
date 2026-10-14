@@ -2779,6 +2779,28 @@ class CapSentinelShimTest(unittest.TestCase):
                                                   model="model"), 105)
                     planner.assert_not_called()
 
+    def test_qwen_cap_never_below_one_tokens_route(self):
+        # #2031: a plan that came out empty left Qwen3.8 on its implicit cap 1
+        # (top-k 10), and every token read its experts from the disk
+        for arch, model_type, top_k, implicit in (("qwen38", "qwen4_exp_text", 10, 1),
+                                                  ("qwen36", "qwen3_5_moe_text", 8, 8)):
+            model = self._model(model_type)
+            cfg_path = Path(model) / "config.json"
+            cfg = json.loads(cfg_path.read_text())
+            (cfg.get("text_config") or cfg)["num_experts_per_tok"] = top_k
+            cfg_path.write_text(json.dumps(cfg))
+            floor = max(implicit, top_k)
+            for planned, expected in ((0, floor), (3, floor), (153, 153)):
+                with self.subTest(arch=arch, planned=planned), patch("resource_plan.build_plan", return_value={
+                        "tiers": {"ram": {"cache_slots_per_layer": planned}}}):
+                    self.assertEqual(cap_for_arch(arch, None, {}, model=model), expected)
+            with self.subTest(arch=arch, plan="fails"), \
+                    patch("resource_plan.build_plan", side_effect=ValueError("no safetensors shards")):
+                self.assertEqual(cap_for_arch(arch, None, {}, model=model), floor)
+            with self.subTest(arch=arch, cap="explicit"), patch("resource_plan.build_plan") as planner:
+                self.assertEqual(cap_for_arch(arch, 2, {}, model=model), 2)
+                planner.assert_not_called()
+
     def test_v41_explicit_and_calibrated_caps_bypass_planning(self):
         for cap, env, expected in ((7, {}, 7), (0, {}, 0),
                                    (None, {"COLI_PROFILE_CAP": "12"}, 12),
@@ -2867,6 +2889,19 @@ class HTTPTest(unittest.TestCase):
             self.request("/v1/models", key="wrong")
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
+
+    def test_models_report_the_context(self):
+        """Agents size their own compaction from the listed context (#1973's limit)."""
+        def entry():
+            with self.request("/v1/models") as response:
+                return json.load(response)["data"][0]
+        self.assertNotIn("context_length", entry())
+        self.server.context_limit = 65536
+        self.addCleanup(setattr, self.server, "context_limit", None)
+        listed = entry()
+        self.assertEqual((listed["context_length"], listed["max_model_len"]), (65536, 65536))
+        with self.request("/v1/models/test-model") as response:
+            self.assertEqual(json.load(response)["context_length"], 65536)
 
     def test_unsupported_modalities_fail_before_engine_work(self):
         cases = (

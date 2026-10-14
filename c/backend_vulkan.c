@@ -807,6 +807,26 @@ static VkShaderModule load_spv(VkDevice dev, const char *path) {
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
+/* The subgroup size a device's pipelines run at (vk_pin_sg, 0 = the driver's choice).
+ * The GEMV shaders (qmatmul, qmatmul_gate_up, the expert batch's) size their reductions
+ * by gl_SubgroupSize, as the chain's do; an Intel GPU compiles a shader at 8, 16 or 32
+ * lanes by its register pressure. Only the chain's pipelines were pinned (#1954): on
+ * Mesa ANV every expert-tier format but int3-g64 came out wrong and qwen36 answered
+ * nothing (#2036), while the chain alone passed. Pinned here too. */
+static int dev_pin_sg(VkDevice dev);
+static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *pin_info(VkDevice dev,
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *rss) {
+#ifdef VK_EXT_subgroup_size_control
+    int n = dev_pin_sg(dev);
+    if (n <= 0) return NULL;
+    *rss = (VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT){
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = (uint32_t)n};
+    return rss;
+#else
+    (void)dev; (void)rss; return NULL;
+#endif
+}
 /* Build a compute pipeline + descriptor pool/set for nbind storage buffers with a
  * pc_size-byte push constant. Used by the 4-binding matmul, 6-binding gate_up and
  * 7-binding absorb attention pipelines. */
@@ -824,8 +844,9 @@ static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModul
     VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
     VKCHECK(vkCreatePipelineLayout(dev, &pli, NULL, plyt), "pipelineLayout");
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss;
     VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin_info(dev, &rss),
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
         .layout = *plyt};
     VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe), "pipeline");
@@ -2865,6 +2886,70 @@ int coli_vk_tensor_ensure2(ColiVkTensor **tensor, const void *weights, const flo
     return upload_tensor_d2(tensor, weights, scales, fmt, I, O, grp);
 }
 
+/* ---- f32 matrices that are bf16 or f16 widened -------------------------------------
+ * Engines keep their dense matrices as f32 on the host, read from bf16 or f16
+ * checkpoints. From bf16 every float has a zero low half; from f16 every float is one an
+ * f16 holds exactly. Either way a 2-byte device copy holds the same values in half the
+ * bytes: fmt 11 (bf16) or fmt 14 (f16). OLMoE-1B-7B's dense part takes 0.75 GB of VRAM
+ * instead of 1.5. A matrix with any other float stays fmt 10. */
+/* f32 bits an f16 holds exactly: a normal half (10 bits of mantissa), a subnormal one
+ * (k * 2^-24, k < 1024), a zero, an infinity, or a NaN whose payload fits */
+static int f32_is_f16(uint32_t u) {
+    const uint32_t a = u & 0x7fffffffu, m = a & 0x7fffffu;
+    const int e = (int)(a >> 23) - 127;
+    if (!a) return 1;
+    if (e == 128) return (m & 0x1fffu) == 0;
+    if (e > 15 || e < -24) return 0;
+    if (e >= -14) return (m & 0x1fffu) == 0;
+    return ((m | 0x800000u) & ((1u << (-1 - e)) - 1)) == 0;   /* subnormal: k = sig >> (-1 - e) */
+}
+/* the f16 of such bits */
+static uint16_t f32_to_f16_exact(uint32_t u) {
+    const uint16_t sign = (uint16_t)((u >> 16) & 0x8000u);
+    const uint32_t a = u & 0x7fffffffu, m = a & 0x7fffffu;
+    const int e = (int)(a >> 23) - 127;
+    if (!a) return sign;
+    if (e == 128) return (uint16_t)(sign | 0x7c00u | (m >> 13));
+    if (e >= -14) return (uint16_t)(sign | ((uint32_t)(e + 15) << 10) | (m >> 13));
+    return (uint16_t)(sign | ((m | 0x800000u) >> (-1 - e)));
+}
+int coli_vk_f32_fmt(const float *w, size_t n) {
+    const uint32_t *u = (const uint32_t *)w;
+    int bf16 = 1, f16 = 1;
+    for (size_t i = 0; i < n && (bf16 || f16); i++) {
+        if (u[i] & 0xffffu) bf16 = 0;
+        if (f16 && !f32_is_f16(u[i])) f16 = 0;
+    }
+    return bf16 ? 11 : f16 ? 14 : 10;
+}
+size_t coli_vk_f32_payload(const float *w, int I, int O) {
+    return coli_vk_tensor_payload(w ? coli_vk_f32_fmt(w, (size_t)I * O) : 10, I, O, 0);
+}
+int coli_vk_tensor_ensure_f32(ColiVkTensor **tensor, const float *w, int I, int O, int dev2) {
+    if (*tensor) {
+        const int f = (*tensor)->fmt;
+        return (f == 10 || f == 11 || f == 14) && (*tensor)->I == I && (*tensor)->O == O;
+    }
+    if (!w) return 0;
+    size_t n = (size_t)I * O;
+    const int fmt = coli_vk_f32_fmt(w, n);
+    if (fmt == 10)
+        return dev2 ? coli_vk_tensor_ensure2(tensor, w, NULL, 10, I, O, 0) : coli_vk_tensor_ensure(tensor, w, NULL, 10, I, O, 0);
+    uint16_t *h = malloc(n * sizeof *h);
+    if (!h) return 0;
+    const uint32_t *u = (const uint32_t *)w;
+    if (fmt == 11) for (size_t i = 0; i < n; i++) h[i] = (uint16_t)(u[i] >> 16);
+    else           for (size_t i = 0; i < n; i++) h[i] = f32_to_f16_exact(u[i]);
+    /* the uploads are done when they return (staged ones wait for their copies) */
+    int ok = dev2 ? coli_vk_tensor_ensure2(tensor, h, NULL, fmt, I, O, 0) : coli_vk_tensor_ensure(tensor, h, NULL, fmt, I, O, 0);
+    free(h);
+    return ok;
+}
+int coli_vk_matmul_f32(ColiVkTensor **tensor, float *y, const float *x, const float *w, int S, int I, int O) {
+    if (!G.ready || !coli_vk_tensor_ensure_f32(tensor, w, I, O, 0)) return 0;
+    return coli_vk_matmul(tensor, y, x, NULL, NULL, (*tensor)->fmt, S, I, O, 0);
+}
+
 /* dev2 mirror of eg_prepare_submit: identical structure on G2's pipelines/scratches. */
 static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                               ColiVkTensor *const *downs, const int *rows, int count,
@@ -3669,6 +3754,7 @@ typedef struct XbCtx {
 } XbCtx;
 static XbCtx g_xb[2];
 static int xb_dev_ready(const XbCtx *X) { return X->d ? G2.ready : G.ready; }
+static int dev_pin_sg(VkDevice dev) { return dev == G.dev ? G.pin_sg : dev == G2.dev ? G2.pin_sg : 0; }
 struct PCV4 { int rows, n; };
 struct PCGRP { int I, O; float limit; int ibase; int kgat; int rpw; };   /* qmatmul_grp.comp, qmatmul_grp_gemv.comp (rpw) */
 #define XB_GV_RPW 64   /* outputs per grouped-GEMV workgroup */
@@ -3788,9 +3874,10 @@ static int xb_layout(XbCtx *X, int nbind, unsigned dynmask, size_t pc, VkDescrip
     return 1;
 }
 static int xb_pipeline(XbCtx *X, VkShaderModule sh, VkPipelineLayout pl, const VkSpecializationInfo *si, VkPipeline *pipe) {
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin_info(X->dev, &rss),
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
     VKCHECK(vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, pipe), "xb pipeline");
     return 1;
 }
@@ -3913,10 +4000,15 @@ static int xb_gemm_slot(const XbCtx *X, int S) {
 }
 
 /* The grouped GEMM's pipelines (qmatmul_grp*.spv beside the main shader); leaves
- * X->grp_rows at 0 when the device or the files do not allow it. */
+ * X->grp_rows at 0 when the device or the files do not allow it. qmatmul_grp_gate_up's
+ * shared arrays have a fixed size, held to the compiled shader's by
+ * tests/test_vk_shared_memory.py: a device with less keeps the per-expert route (#1998). */
+#define GRP_GATE_UP_SHARED 36864u
 static void xb_grp_init(XbCtx *X) {
     const char *e = getenv("COLI_VK_XB_GROUPED");
     if (X->d || !G.has_bda || !G.has_coop || G.coop_sg != 64 || (e && *e == '0')) return;
+    VkPhysicalDeviceProperties lp; vkGetPhysicalDeviceProperties(X->phys, &lp);
+    if (lp.limits.maxComputeSharedMemorySize < GRP_GATE_UP_SHARED) return;
     const char *nm[2] = {"qmatmul_grp.spv", "qmatmul_grp_gate_up.spv"};
     for (int v = 0; v < 2; v++) {
         char path[1100];

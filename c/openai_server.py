@@ -5000,6 +5000,19 @@ def model_arch(model):
     return resolve_model(model).descriptor.id
 
 
+def _route_top_k(model):
+    """num_experts_per_tok of a model directory's config.json (its text_config first), 0 when unknown."""
+    try:
+        cfg = json.loads((Path(model) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return 0
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+    try:
+        return max(0, int(text.get("num_experts_per_tok") or cfg.get("num_experts_per_tok") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def cap_for_arch(arch, cap, env=None, model=None):
     """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
 
@@ -5060,13 +5073,22 @@ def cap_for_arch(arch, cap, env=None, model=None):
             if arch in ("deepseek_v41", "mimo"):
                 raise
             # The Qwen engines ran on their implicit cap before the plan was
-            # applied: a model the planner cannot read still starts as before.
-            print(f"[{arch}] no RAM plan ({error}); {limits.implicit_cap} expert cache "
+            # applied: a model the planner cannot read still starts as before,
+            # with at least one token's route (top-k) in the cache.
+            floor = max(limits.implicit_cap, _route_top_k(model))
+            print(f"[{arch}] no RAM plan ({error}); {floor} expert cache "
                   f"slots/layer, --cap or coli tune sets more", file=sys.stderr)
-            return limits.implicit_cap
-        if slots < 1:
+            return floor
+        # A Qwen cache below one token's route (top-k) reads that token's experts
+        # from the disk at every step: Qwen3.8's implicit cap is 1 and its route
+        # 10, and a Windows box whose free RAM made the plan come out empty
+        # decoded at 0.03 tok/s while the engine measured room for 99 (#2031).
+        floor = max(limits.implicit_cap, _route_top_k(model)) if arch in ("qwen36", "qwen38") else 1
+        if slots < floor:
             if arch in ("qwen36", "qwen38"):
-                return limits.implicit_cap
+                print(f"[{arch}] RAM plan: {max(slots, 0)} expert cache slots/layer, below one "
+                      f"token's route; starting at {floor} (--cap or --ram sets more)", file=sys.stderr)
+                return floor
             raise ValueError(f"{family_by_id(arch).display_name} RAM budget cannot hold one "
                              f"expert slot per layer")
         print(f"[{'v41' if arch == 'deepseek_v41' else arch}] RAM plan: {slots} expert cache "
@@ -5500,6 +5522,14 @@ class Engine:
         decision_head_env(child_env, model)
         # before the cap: the RAM plan reserves the context it is given
         self.context_limit = chat_context_env(child_env, family, model, kv_slots)
+        # No ceiling from the operator (0): the context the engine holds is the ceiling. A
+        # reasoning model's turn is its reasoning plus its answer, and any fixed number
+        # below the context cut some of them short (#382); the engines stop at the end of
+        # the context on their own, so a turn ends when the model closes it or there.
+        if not max_tokens:
+            max_tokens = self.context_limit or family.limits.interactive_max_output
+            child_env["NGEN"] = str(max_tokens)
+        self.max_tokens = max_tokens
         resolved_cap = cap_for_arch(arch, cap, child_env, model=model)
         child_env.pop("COLI_PROFILE_CAP", None)
         child_env.pop("COLI_PLAN_CAP", None)
@@ -6344,6 +6374,12 @@ class APIServer(ThreadingHTTPServer):
         entry = model_object(self.model_id, self.created)
         entry["input_modalities"] = self.input_modalities()
         entry["capabilities"] = self.capabilities()
+        limit = getattr(self, "context_limit", None)
+        if limit and "chat" in entry["capabilities"]:
+            # The context the engine holds, by the names agents look for (Hermes Agent,
+            # vLLM and LiteLLM clients). Without it they assume a window the engine does
+            # not have (Hermes: 128k), compact too late and end in context_length_exceeded.
+            entry["context_length"] = entry["max_model_len"] = int(limit)
         if is_image_engine(self.engine):
             info = getattr(self.engine, "info", None) or {}
             entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
@@ -6867,6 +6903,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     payload["context_compaction"] = True
                     if getattr(self.server, "context_limit", None):
                         payload["context_tokens"] = self.server.context_limit
+                    # the response ceiling a request is lowered to: a client's default
+                    payload["max_tokens"] = self.server.max_tokens
                     tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
@@ -8607,8 +8645,8 @@ class APIHandler(BaseHTTPRequestHandler):
 def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None):
-    if not 1 <= max_tokens:
-        raise ValueError("max_tokens must be positive")
+    if not 0 <= max_tokens:
+        raise ValueError("max_tokens cannot be negative (0: the context the engine holds)")
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
     if max_queue < 0:
@@ -8684,6 +8722,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 sys.exit(1)
         server.engine = runtime
         server.context_limit = getattr(runtime, "context_limit", None)
+        if not max_tokens:   # the engine resolved it: the context it holds
+            server.max_tokens = getattr(runtime, "max_tokens", None) or 1024
         if family.modality != "image":
             # Said once at start-up, so a checkpoint that declares a tower it does
             # not carry is visible in the log and not only in a client's 400.
@@ -8732,7 +8772,9 @@ def main():
     # #379 -- glm arch resolves platform-aware, non-glm gets the legacy 8). An
     # explicit value, 0 included, reaches the engine verbatim.
     parser.add_argument("--cap", type=int, default=None, help="cache slots/layer (default: auto)")
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    # 0: the context the engine holds (a turn ends when the model closes it or the
+    # context is full); a number is a ceiling every request is lowered to
+    parser.add_argument("--max-tokens", type=int, default=0)
     parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
     parser.add_argument("--queue-timeout", type=float,
                         default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))

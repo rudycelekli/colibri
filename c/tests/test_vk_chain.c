@@ -2766,6 +2766,9 @@ int main(int argc, char **argv) {
     if (getenv("COLI_VK_DEV2")) { test_dev2(spv); printf("dev2 done\n"); }
     /* a diffusion step's attention: one tile, partial tiles of rows and keys, every head
      * dim (last: the shared random stream the tests above draw from stays theirs) */
+    /* chain_attn_full declares 38 KiB of shared memory and a device with less declines it
+     * (#1998); Lavapipe reports 32 KiB of what is host memory, so the test lifts the limit */
+    setenv("COLI_VK_SHARED_LIMIT", "65536", 1);
     test_attn_full(5, 9, 2, 32); test_attn_full(64, 64, 1, 128); test_attn_full(130, 200, 3, 128);
     test_attn_full(70, 129, 2, 64); test_attn_full(1, 300, 4, 128);
     printf("attn full done\n");

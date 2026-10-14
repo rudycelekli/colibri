@@ -492,6 +492,13 @@ def ngen_for(a, interactive=False, family=None):
         return limits.interactive_max_output if interactive else limits.default_max_output
     return 16384 if interactive else 1024
 
+# The ceiling a served session (serve, web, chat) gives the gateway: --ngen, or 0 when
+# it is not given, which the gateway reads as the context the engine holds. A reasoning
+# model's turn is its reasoning plus its answer: any fixed number below the context cut
+# some of them short (#382), and the engines stop at the end of the context anyway.
+def serve_max_tokens(a):
+    return getattr(a, "ngen", None) or 0
+
 _PROFILE_CAP_ENV = "COLI_PROFILE_CAP"
 _PLAN_CAP_ENV = "COLI_PLAN_CAP"
 
@@ -2018,10 +2025,11 @@ def chat_attached(a, base, model_id):
         # motore che streamma gli esperti da disco, "max" vuol dire centinaia
         # di token di riflessione prima della prima parola di risposta.
         request = {"model":model_id,"messages":msgs,"stream":True,
-                   "max_tokens":ngen_for(a,interactive=True),
                    # a chat longer than the context goes on from a summary of its start
                    "context_compaction":"auto",
                    "stream_options":{"include_usage":True}}   # exact completion_tokens in the last chunk
+        # without --ngen the server's own ceiling: the context it holds (serve_max_tokens)
+        if getattr(a,"ngen",None): request["max_tokens"]=a.ngen
         if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
         if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
         elif arch in CHAT_THINK_OFF:
@@ -2033,7 +2041,7 @@ def chat_attached(a, base, model_id):
         print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
         md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False; think_open=False
-        exact_tokens=None
+        exact_tokens=None; finish=None
         try:
             with urllib.request.urlopen(req) as r:
                 for raw in r:
@@ -2056,6 +2064,7 @@ def chat_attached(a, base, model_id):
                               f"model's context: the model now reads a summary of them{C.r}")
                         sp=Spinner("thinking…"); sp.start()
                     for ch in ev.get("choices",[]):
+                        if ch.get("finish_reason"): finish=ch["finish_reason"]
                         d=ch.get("delta",{})
                         rtxt=d.get("reasoning_content")
                         if rtxt and os.environ.get("COLI_SHOW_THINK","1")=="0":
@@ -2109,8 +2118,12 @@ def chat_attached(a, base, model_id):
         else: msgs.pop()                              # turno vuoto: non sporcare la history
         el=time.time()-t0
         footer=render_gen_stats(gen_stats("".join(reply), el, exact_tokens, interrupted), chat_stats_mode(a))
-        if footer: print(f"\r  {C.dgray}└─ {footer}{C.r}\n")
-        else: print()
+        if footer: print(f"\r  {C.dgray}└─ {footer}{C.r}")
+        if finish=="length" and not interrupted:
+            # the turn hit the ceiling (--ngen) or filled the context, not its own end
+            print(f"  {C.yel}…cut off: the response reached "
+                  f"{'--ngen ('+str(a.ngen)+' tokens)' if getattr(a,'ngen',None) else 'the end of the context'}{C.r}")
+        print()
     print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
 
 def kv_resume_notice(model_dir):
@@ -2802,7 +2815,7 @@ def cmd_chat(a):
         cmd=[sys.executable,openai_server.__file__,"--model",a.model,
              "--engine",engine,"--arch",arch,"--model-id",model_id,
              "--host","127.0.0.1","--port","8000","--max-tokens",
-             str(ngen_for(a,interactive=True,family=family))]
+             str(serve_max_tokens(a))]
         if a.cap is not None: cmd+=["--cap",str(a.cap)]
         if a.api_key: cmd+=["--api-key",a.api_key]
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
@@ -3043,7 +3056,7 @@ def cmd_serve(a):
             env["CLUSTER_WORKERS"] = ",".join(workers)
             print(f"  {C.dim}[CLUSTER] discovered {len(workers)} expert worker(s){C.r}", file=sys.stderr)
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
-              a.cap,ngen_for(a,interactive=True,family=family),engine,
+              a.cap,serve_max_tokens(a),engine,
               env,a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host,
               family=family)
@@ -3653,6 +3666,9 @@ def main():
     pset.add_argument("--no-gpu",action="store_true",help="same as --backend cpu")
     pset.add_argument("--host",default=None,help="address to serve on (default 127.0.0.1)")
     pset.add_argument("--port",type=int,default=None,help="port to serve on (default 8000)")
+    pset.add_argument("--ctx",type=int,default=0,metavar="TOKENS",
+                      help="context the server starts with, kept for `coli start` (0: automatic, "
+                      "from the memory there is)")
     pset.add_argument("--no-start",action="store_true",help="set up, but do not start the server")
     pset.add_argument("--background",action="store_true",
                       help="start the server in the background (log in the setup folder)")

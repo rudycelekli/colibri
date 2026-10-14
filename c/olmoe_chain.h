@@ -84,14 +84,14 @@ typedef struct {
 } OlmChain;
 
 
-/* A resident f32 matrix [O x I] on the device: the copy the per-matrix path uses
- * (matmul_res), uploaded here if it has not been yet. NULL: refused (it stays so). */
+/* A resident f32 matrix [O x I] on the device (bf16 or f16 where that holds it exactly): the
+ * copy the per-matrix path uses (matmul_res), uploaded here if it has not been yet.
+ * NULL: refused (it stays so). */
 static ColiVkTensor *olc_tensor(int d, void **vk, const float *w, int I, int O) {
     if (*vk == (void *)&g_vk_refused) return NULL;
     if (*vk) return (ColiVkTensor *)*vk;   /* with the dense weights on the device only, w is NULL */
     if (!w) return NULL;
-    if (!(d ? coli_vk_tensor_ensure2((ColiVkTensor **)vk, w, NULL, 10, I, O, 0)
-            : coli_vk_tensor_ensure((ColiVkTensor **)vk, w, NULL, 10, I, O, 0))) { *vk = &g_vk_refused; return NULL; }
+    if (!coli_vk_tensor_ensure_f32((ColiVkTensor **)vk, w, I, O, d)) { *vk = &g_vk_refused; return NULL; }
     return (ColiVkTensor *)*vk;
 }
 
@@ -239,10 +239,10 @@ static int olc_bufs(OlmChain *ch, Model *m, int rows);
 /* ---- the fit: how many layers the chain places (vk_chain.h, vkc_fit) -------------- */
 /* In model_init, before olm_dho_start and the tier: the chain decided as olm_dho_start
  * and olc_start decide it (silently: olc_start prints it after the tier), its pipelines
- * up, and N from each layer's bytes (q, k, v, o and the router as f32 tensors, the K/V
- * mirror at the split's floor of three blocks, its share of the parameter arena), the
- * fixed bytes (one prompt chunk's scratch from the reservations themselves, its rows'
- * read-back, PILOT's) and lm_head as the tail. The CPU's layers and (unless the fit puts
+ * up, and N from each layer's bytes (q, k, v, o and the router as the device will hold
+ * them, bf16 or f16 where exact, the K/V mirror at the split's floor of three blocks, its share
+ * of the parameter arena), the fixed bytes (one prompt chunk's scratch from the
+ * reservations themselves, its rows' read-back, PILOT's) and lm_head as the tail. The CPU's layers and (unless the fit puts
  * it up) the head are marked refused. N = 0: the chain off, its blocks released. Not run
  * for a geometry the shaders do not take (the chain declines at its first forward, as
  * before). */
@@ -256,9 +256,13 @@ static void olc_fit_start(Model *m) {
     int B = e && *e ? atoi(e) : 64;
     if (B < 1) B = 1;
     for (int i = 0; i < L; i++) {
-        per[i] = 4 * vkc_fit_tensor(10, D, D, 0) + vkc_fit_tensor(10, D, E, 0) +
-                 2 * vkc_fit_buf((size_t)H * 3 * B * hd * sizeof(float)) + 4 * (size_t)D * sizeof(float);
-        mat[i] = 4 * coli_vk_tensor_payload(10, D, D, 0) + coli_vk_tensor_payload(10, D, E, 0);
+        const Layer *l = &m->L[i];
+        const float *w[5] = {l->q, l->k, l->v, l->o, l->gate};
+        for (int j = 0; j < 5; j++) {
+            int O = j < 4 ? D : E, f = w[j] ? coli_vk_f32_fmt(w[j], (size_t)D * O) : 10;
+            per[i] += vkc_fit_tensor(f, D, O, 0); mat[i] += coli_vk_tensor_payload(f, D, O, 0);
+        }
+        per[i] += 2 * vkc_fit_buf((size_t)H * 3 * B * hd * sizeof(float)) + 4 * (size_t)D * sizeof(float);
     }
     OlmChain cnt; memset(&cnt, 0, sizeof cnt);
     int rows = vkc_fit_rows(256);
@@ -268,7 +272,7 @@ static void olc_fit_start(Model *m) {
     olc_res(&cnt.xd, (size_t)rows * D, VKC_DOWN);
     if (g_pilot) olc_res(&cnt.xpd, (size_t)rows * D, VKC_DOWN);
     g_olc_fitsum = NULL;
-    size_t tail = m->lm_head ? vkc_fit_tensor(10, D, c->vocab, 0) : 0;
+    size_t tail = m->lm_head ? vkc_fit_tensor(coli_vk_f32_fmt(m->lm_head, (size_t)D * c->vocab), D, c->vocab, 0) : 0;
     int n = vkc_fit("olmoe", L, per, mat, fixed, tail, &g_olc_fit);
     /* the chain's pipelines now, after the fit read the free memory */
     if (n > 0 && !vkc_init()) { free(per); free(mat); return; }   /* no chain after all (olc_start finds it so too): no fit */

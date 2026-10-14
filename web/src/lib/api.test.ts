@@ -59,7 +59,7 @@ describe("chat request extensions", () => {
     headers: { "content-type": "text/event-stream" },
   })
 
-  async function requestBody(cacheSlot?: number, compact?: boolean) {
+  async function requestBody(cacheSlot?: number, compact?: boolean, maxTokens: number | null = 8) {
     const fetchMock = vi.fn().mockResolvedValue(completedStream())
     vi.stubGlobal("fetch", fetchMock)
     await streamChat({
@@ -68,7 +68,7 @@ describe("chat request extensions", () => {
       model: "test-model",
       messages: [],
       temperature: 0,
-      maxTokens: 8,
+      maxTokens: maxTokens ?? undefined,
       enableThinking: false,
       cacheSlot,
       compact,
@@ -84,6 +84,13 @@ describe("chat request extensions", () => {
 
   it("sends cache_slot zero when colibrì advertises KV slots", async () => {
     expect(await requestBody(0)).toMatchObject({ cache_slot: 0 })
+  })
+
+  /* #382: no ceiling of the user's own leaves the server's, which on colibrì is the
+     context the engine holds; a fixed 4096 cut a reasoning model's turns short */
+  it("sends max_completion_tokens only when the user set one", async () => {
+    expect(await requestBody(undefined, undefined, 512)).toMatchObject({ max_completion_tokens: 512 })
+    expect(await requestBody(undefined, undefined, null)).not.toHaveProperty("max_completion_tokens")
   })
 
   it("asks a colibrì server for context compaction, and only a colibrì server", async () => {

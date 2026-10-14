@@ -75,6 +75,9 @@ export interface HealthResponse {
   /* the server compacts a chat that outgrows the context when asked (context_compaction) */
   context_compaction?: boolean
   context_tokens?: number
+  /* the response ceiling a request is lowered to; without a ceiling of its own a
+     request gets this one: on colibrì the context the engine holds */
+  max_tokens?: number
 }
 
 export interface ProfileTurn {
@@ -222,7 +225,8 @@ export interface StreamChatOptions {
   model: string
   messages: ChatMessage[]
   temperature: number
-  maxTokens: number
+  /* undefined: no max_completion_tokens at all, the server's own ceiling */
+  maxTokens?: number
   enableThinking: boolean
   cacheSlot?: number
   /* ask the server to summarize a conversation that outgrows the context; only for a
@@ -250,7 +254,7 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
           ] }
         : { role, content }),
       temperature: options.temperature,
-      max_completion_tokens: options.maxTokens,
+      ...(options.maxTokens === undefined ? {} : { max_completion_tokens: options.maxTokens }),
       enable_thinking: options.enableThinking,
       ...(options.cacheSlot === undefined ? {} : { cache_slot: options.cacheSlot }),
       /* A conversation longer than the context goes on, on a summary of its

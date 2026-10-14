@@ -1122,7 +1122,7 @@ f32 throughout, as the CPU's f32 path.
 | `COLI_VK_CHAIN_FLASH` | `16` | Rows from which a forward's plain causal attention runs on the matrix units (`chain_attn_flash.comp`: query heads of one kv head folded into 16-row tiles, K/V staged once per block as f16, two passes); `0` never. Needs cooperative matrices at subgroup size 64; otherwise, and for a selection list, a window, a ring or a sink, the blocked shader or `chain_attn.comp`. On a Radeon 8060S (Qwen3.6, 1011-token prompt) the attention went from 186 ms (`chain_attnb`) to 22 ms, the first token from 2.08 to 1.85 s, perplexity unchanged (7.65). |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
 | `COLI_VK_SUBGROUP` | on where the size varies | Every chain pipeline requires the subgroup size the device reports (`VK_EXT_subgroup_size_control`), where the device has more than one. Without it an Intel Iris Xe (Windows driver 101.7076) compiled the chain's GEMVs at another size than the shaders read: Qwen3.6 answered garbage with the chain on and correctly with it off. `0`: the driver's choice. |
-| `COLI_VK_CHAIN_GEMV2` | on where supported | `0`: the int8 decode matrices keep `chain_gemv.comp` instead of `chain_gemv2.comp` (rows a workgroup by the matrix's length). On a Radeon 8060S (Qwen3.6, a 256-token answer, int8 trunk) decode went from 36.8 to 39.0 tok/s; at int4 (`COLI_DENSE_BITS=4`) it measured slower, so it takes int8 only. |
+| `COLI_VK_CHAIN_GEMV2` | on where supported | `0`: the int8 decode matrices keep `chain_gemv.comp` instead of `chain_gemv2.comp` (rows a workgroup by the matrix's length). On a Radeon 8060S (Qwen3.6, a 256-token answer, int8 trunk) decode went from 36.8 to 39.0 tok/s; at int4 (`COLI_DENSE_BITS=4`) it measured slower, so it takes int8 only. It stages x in the device's shared memory, up to 64 KiB (#1998). |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
 | `COLI_VK_CHAIN_PROF` | off | `1`: one `[VK] chain profile` line of device time per kind of op (timestamps). |
 | `COLI_VK_KV_SPLIT` | on | `0`: never split the KV cache past the device's budget ([below](#a-kv-cache-past-the-devices-budget)); the whole mirrors, and past the budget the chain declines. |
@@ -2624,6 +2624,25 @@ so this says only that staging costs nothing here. **Not measured: a discrete ca
 Resizable BAR**, the case staging is for (none is available); there the copies cross PCIe
 once per upload and the device then reads VRAM instead of the window or system RAM. The
 contributor who reported the RTX 3070 offered to run it.
+
+## f32 matrices that came from bf16 or f16
+
+Several engines keep dense matrices as f32 on the host although the checkpoint stores
+them in two bytes a value (bf16, or f16 in some OLMoE releases): OLMoE's attention,
+routers and lm_head, Kimi K3's routers and KDA decay and beta projections (and its whole
+trunk at `K3_BITS=32`), Inkling's routers, GLM-5.3's f32 trunk. Every such float is a
+bf16 or an f16 widened, so the device copy goes up in two bytes a value, as bf16 (fmt 11)
+or f16 (fmt 14): the same values in half the bytes. On OLMoE-1B-7B the dense part takes
+0.75 GB instead of 1.5 GB, and the expert tier has the rest. The check is exact and runs
+once per matrix at upload (`coli_vk_f32_fmt`): bf16 when every float has a zero low half,
+else f16 when an f16 holds every float, else the matrix stays f32 (fmt 10). The chain's
+fit, the expert tier's dense budget and the dense-host decision count each matrix at the
+format it will take, and so does `coli plan`: a BF16 or F16 tensor from the checkpoint's
+header, an F32 one from its values (the one read of tensor values the planner makes).
+
+The values are the same, so the tokens are the CPU's; the logits can differ from an
+f32 upload in the last bits, because the shaders sum a 2-byte row in steps of 8 rather
+than 4.
 
 ## Dense weights on the device only
 
