@@ -49,6 +49,7 @@ class WavAudioTest(unittest.TestCase):
         self.assertEqual(error['code'], 'invalid_value')
         self.assertEqual(engine.calls, [])
 
+
     def extensible_fmt(self, bits=16, subtype=1, extension_size=22):
         # WAVEFORMATEXTENSIBLE: cbSize, valid bits, channel mask, SubFormat GUID.
         guid = struct.pack('<IHH8s', subtype, 0, 0x0010, bytes.fromhex('800000aa00389b71'))
@@ -77,6 +78,13 @@ class WavAudioTest(unittest.TestCase):
             decoded = openai_server.decode_wav_mono16k(
                 self.wav(fmt=self.extensible_fmt(bits, subtype), data=data), 'audio')
             self.np.testing.assert_array_equal(decoded, expected)
+
+    def test_nonfinite_float_audio_is_rejected_before_generation(self):
+        for value in (float('nan'), float('inf'), float('-inf')):
+            with self.subTest(value=value):
+                self.assert_invalid_http(self.wav(fmt=self.fmt(bits=32, encoding=3),
+                                                  data=struct.pack('<ffff', 0.0, value, 0.5, -0.5)))
+
 
     def test_short_fmt_is_client_error(self):
         self.assert_invalid_http(self.wav(fmt=b'\x01\0'))
