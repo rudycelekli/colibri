@@ -30,6 +30,6 @@ jobs:
           SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
           python tests/test_glm_oracle.py
       - name: Python suite with oracle dependencies available
-        run: python -m unittest discover -s c/tests -p 'test_*.py'
+        run: make -C c test-python PYTHON=python
       - name: Verify tracked sources remain unchanged
         run: git diff --exit-code
