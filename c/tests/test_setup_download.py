@@ -93,6 +93,18 @@ class DownloadTest(unittest.TestCase):
             "https://example.test/file", dest, {"size": 6},
             opener=lambda *a, **k: Response("bytes 3-5/6"), retries=0)
         self.assertEqual(Path(dest).read_bytes(), b"abcdef")
+    def test_windows_empty_file_needs_no_transport(self):
+        dest = os.path.join(self.dst, "empty.txt")
+        spec = {"size": 0, "git_oid": hashlib.sha1(b"blob 0\0").hexdigest()}
+        with mock.patch.object(setup_download, "wsl_windows_path", return_value=None) as translate:
+            result = setup_download.download_file_windows(
+                "https://example.test/empty.txt", dest, spec, "unused-curl")
+        self.assertEqual(result, "downloaded")
+        self.assertEqual(Path(dest).read_bytes(), b"")
+        self.assertFalse(Path(dest + ".part").exists())
+        translate.assert_not_called()
+        self.assertEqual(setup_download.download_file_windows(
+            "unused", dest, spec, "unused-curl"), "present")
 
     def test_listing_sizes_hashes_and_filters(self):
         files = {f["path"]: f for f in self.listing()}
