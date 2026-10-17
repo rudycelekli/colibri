@@ -10,7 +10,7 @@ is safe on any machine. See also [SETTINGS.md](SETTINGS.md) and
 |---|---|
 | `--temp T` | token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy) |
 | `--topp 0.7` | adaptive expert top-p (30–40% less disk; lossy — prints a warning) |
-| `--ngen N` | max tokens per answer (`:more` in chat continues a truncated one) |
+| `--ngen N` | max tokens per answer (`:more` in chat continues a truncated one); without it a chat server lets an answer run to the end of the context |
 | `--repin N` | adapt RAM/VRAM hot experts every N emitted tokens |
 | `RAM_GB=<n>` | claim more RAM for the expert cache than the conservative auto-detect |
 | `PIN=stats PIN_GB=g` | pin the hottest experts from a measured usage profile |
@@ -181,6 +181,46 @@ engine's history, and how `PIN=<file>` differs from `PIN=auto` in how much it
 trusts a file are documented in
 [routing-telemetry.md](routing-telemetry.md).
 
+### What a pin budget buys (`tools/usage_coverage.py`)
+
+AUTOPIN and the CUDA tier size the pin by how much memory is free. To see what
+that memory buys, read the history's coverage curve: the share of past expert
+selections that the best pinned set of a given size would have served.
+
+```bash
+cd c
+python3 tools/usage_coverage.py <model>/.coli_usage --expert-mb 1.7 --vram-gb 6 --ram-gb 8
+```
+
+It prints how concentrated the routing is (top 1/10/30% of experts, Gini,
+effective number of experts), coverage at a list of budgets, the smallest budget
+for 70/80/90%, the knee where an extra GB starts buying less than average,
+and a VRAM-then-RAM plan in the order `pin_load` fills them (VRAM less
+`--reserve-gb`, default 2 like `CUDA_RESERVE_GB`). `--min-gain G` marks where
+one more GB adds fewer than G points. `--expert-mb` is the size of one routed
+expert; without it budgets are given in percent of experts.
+
+On the shipped Qwen3.6 profile (`profiles/qwen36-35b.coli_usage`, 1.7 MB per
+int4 expert):
+
+| pinned | experts | coverage |
+|---:|---:|---:|
+| 1 GB | 5.7% | 23.4% |
+| 2 GB | 11.5% | 37.4% |
+| 4 GB | 23.0% | 56.6% |
+| 6 GB | 34.5% | 70.2% |
+| 8 GB | 45.9% | 80.5% |
+
+Coverage is measured on the history it was built from, so it overstates what
+the same pin serves on new prompts. `--holdout <files>` scores the ranking on
+other histories: the shipped Qwen3.8 profile covers 70% of its own selections
+with 26% of experts, but the same experts cover 57.7% of a separate Qwen3.8
+session (`docs/experiments/vulkan-qwen38-mtp-2026-10-05/history.usage.gz`).
+Coverage is also a lower bound on the hit rate, since the LRU serves part of
+the rest. Models without hot experts (OLMoE,
+[#864](https://github.com/JustVugg/colibri/issues/864)) show up as a nearly
+straight curve.
+
 ## Router-lookahead prefetch (`PILOT=1`, experimental)
 
 GLM-5.2's expert routing is measurably predictable *ahead of time* — applying
@@ -202,6 +242,23 @@ family. For byte-exact reproducibility across runs: `DRAFT=0`, plus `IDOT=0
 COLI_CUDA=0` if you also want kernel-family/GPU independence. Acceptance
 percentages are not comparable across engine versions under `--topp`
 ([#163](https://github.com/JustVugg/colibri/issues/163) has the full story).
+
+GLM-5.2's native MTP head drafts tokens that the main model verifies in one
+batched forward: 2.2–2.8 tokens/forward when it pays. The MTP head must be
+**int8**: int4 heads collapse to 0–4% acceptance
+([#8](https://github.com/JustVugg/colibri/issues/8)). Grammar-forced drafts
+([`GRAMMAR=file.gbnf`](grammar-draft.md)) add nearly free acceptance on
+constrained JSON output. Whether speculation is a net win depends on your cache
+temperature: measure, and use `DRAFT=0` when it does not pay.
+
+Verify batches can also opt into an **exact attention core** with
+`COLI_EXACT_VERIFY=1` ([#689](https://github.com/JustVugg/colibri/issues/689)):
+the CPU MLA-absorb score and context dots accumulate integer products and round
+once, so a near-tie in a verify row resolves the same way on every host, at
+roughly 0.6x tok/s on a tiny oracle (the dot itself is ~5–7x the float loop).
+Two limits to know: with a quantised KV cache (`tq1`, TQ or int8 KV) the
+context dot keeps the float path, so exactness there is not provided; and a
+real near-tie flip has only been argued, not yet caught on GLM-5.2 at n=64.
 
 ## Approximate mode: `DEGRADE_ZERO` (opt-in, OLMoE-calibrated)
 

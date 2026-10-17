@@ -71,7 +71,7 @@ static inline int compat_open_direct(const char *path){
  *                                  text-mode translation — NEVER use
  *                                  _read/_lseeki64 which are racy AND
  *                                  corrupt 0x0A bytes in binary files).
- * posix_fadvise -> no-op (advisory only; macOS already no-ops DONTNEED).
+ * posix_fadvise -> bounded background WILLNEED; other advice is a no-op.
  * mlock         -> compat_mlock  (VirtualLock + crescita working set).
  * posix_memalign->_aligned_malloc(free must be compat_aligned_free).
  * rename        -> compat_rename (MoveFileEx MOVEFILE_REPLACE_EXISTING;
@@ -112,18 +112,11 @@ static inline int compat_open_direct(const char *path){
 #define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
 #define COMPAT_O_BINARY O_BINARY
 
-/* --- posix_fadvise: Windows has no direct equivalent. Semantics:
- *      WILLNEED  -> warm the OS page cache so a later synchronous pread finds the
- *                   pages resident. Implemented as an overlapped background ReadFile
- *                   into a throwaway scratch buffer (fire-and-forget readahead). Called
- *                   from the dedicated PILOT I/O thread / next-block readahead in moe(),
- *                   NEVER inline on the hot path (the existing comment at glm.c:2847
- *                   measures inline fadvise submit at ~0.5ms x 169k calls = +92s/48tok).
- *                   Each call owns its OVERLAPPED + scratch buffer -> thread-safe.
- *      DONTNEED  -> no-op: Windows' standby-list trimming self-regulates under pressure,
- *                   and on a low-RAM host keeping the pages is what we want for reuse.
- *                   Matches macOS (compat.h:16-19) which no-ops DONTNEED for the same
- *                   reason. The engine only ever uses DONTNEED as an advisory. */
+/* WILLNEED schedules bounded background prefetch, including for ordinary
+ * synchronous CRT file handles. Supplying OVERLAPPED to ReadFile alone does
+ * not make such handles asynchronous. The worker owns a duplicate handle and
+ * prefetches a read-only mapping without a throwaway copy of the expert.
+ * DONTNEED remains advisory/no-op: Windows manages standby pages itself. */
 #ifndef POSIX_FADV_NORMAL
 #define POSIX_FADV_NORMAL      0
 #define POSIX_FADV_RANDOM      1
@@ -132,27 +125,9 @@ static inline int compat_open_direct(const char *path){
 #define POSIX_FADV_DONTNEED    4
 #define POSIX_FADV_NOREUSE     5
 #endif
+#include "compat_prefetch_win.h"
 static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
-    if(advice!=POSIX_FADV_WILLNEED || len<=0) return 0;
-    intptr_t osfh=_get_osfhandle(fd);
-    if(osfh==-1 || osfh==-2) return 0;
-    HANDLE h=(HANDLE)osfh;
-    /* Cap the readahead window: reading a whole 19MB expert per hint is fine on the
-     * PILOT thread, but a pathological huge len would spike transient memory. */
-    size_t rdlen = (len>(off_t)(64*1024*1024)) ? (size_t)(64*1024*1024) : (size_t)len;
-    char *buf=(char*)_aligned_malloc(rdlen, 4096);
-    if(!buf) return -1;
-    OVERLAPPED ov={0};
-    ov.Offset     = (DWORD)( (off_t)off        & 0xFFFFFFFFULL);
-    ov.OffsetHigh = (DWORD)(((off_t)off >> 32) & 0xFFFFFFFFULL);
-    /* Issue an overlapped read. With a non-OVERLAPPED-opened handle ReadFile still
-     * accepts lpOverlapped (it carries the 64-bit offset) and blocks until the read
-     * completes — but crucially it populates the standby page cache for this region,
-     * so the later synchronous pread on the same offsets faults from RAM not disk. */
-    DWORD got=0;
-    ReadFile(h, buf, (DWORD)rdlen, &got, &ov);
-    _aligned_free(buf);
-    return 0;
+    return advice == POSIX_FADV_WILLNEED ? compat_prefetch_file(fd, off, len) : 0;
 }
 #define posix_fadvise compat_fadvise
 
@@ -166,10 +141,18 @@ static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
  * dal campo diventa un tirare a indovinare (#307: tre giri di ipotesi tra
  * tre persone perche' il codice vero non compariva da nessuna parte). */
 static __thread DWORD compat_pread_lasterr __attribute__((unused));
+/* A descriptor from compat_open_overlapped() is opened for overlapped I/O, so
+ * that the reads of several threads on it are in flight together: a synchronous
+ * handle takes them one at a time, whatever the thread count. A read on such a
+ * handle may return before it is done, and is then waited for on an event that
+ * belongs to this call -- the file handle itself is signalled by every thread's
+ * completions. On a synchronous handle the event is set and never needed. */
 static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
     HANDLE h = (HANDLE)osfh;
+    HANDLE done = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if(!done){ compat_pread_lasterr = GetLastError(); errno = EIO; return -1; }
     size_t total = 0;
     while(total < n){
         size_t chunk = n - total;
@@ -177,18 +160,23 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
         OVERLAPPED ov = {0};
         ov.Offset     = (DWORD)( (off + (off_t)total)        & 0xFFFFFFFFULL);
         ov.OffsetHigh = (DWORD)(((off + (off_t)total) >> 32) & 0xFFFFFFFFULL);
+        ov.hEvent     = done;
         DWORD rd = 0;
-        if(!ReadFile(h, (char*)buf + total, chunk32, &rd, &ov)){
+        BOOL ok = ReadFile(h, (char*)buf + total, chunk32, &rd, &ov);
+        if(!ok && GetLastError() == ERROR_IO_PENDING) ok = GetOverlappedResult(h, &ov, &rd, TRUE);
+        if(!ok){
             DWORD err = GetLastError();
             if(err == ERROR_HANDLE_EOF) break;  /* past EOF → return bytes read (0 if none, matching POSIX pread) */
             compat_pread_lasterr = err;         /* preserva il codice VERO per il report (#307) */
             if(err == ERROR_INVALID_HANDLE || err == ERROR_INVALID_FUNCTION) errno = EBADF;
             else errno = EIO;
+            CloseHandle(done);
             return -1;
         }
         total += rd;
         if(rd == 0 || rd < chunk32) break;  /* EOF or partial (file truncated) */
     }
+    CloseHandle(done);
     return (ssize_t)total;
 }
 #define pread(fd,buf,n,off) compat_pread(fd,buf,n,off)
@@ -311,6 +299,23 @@ static inline int compat_open_direct(const char *path){
     return fd;
 }
 
+/* --- compat_open_overlapped: a second descriptor for the reads that run together ---
+ * The CRT's open() gives a synchronous handle, which serves one read at a time
+ * whatever the thread count. A reader that finds a file's first descriptor
+ * taken reads through this one instead (st.h, st_shard_enter): opened with
+ * FILE_FLAG_OVERLAPPED, it lets any number of reads be in flight. -1 when it
+ * cannot be opened; the caller then keeps the one descriptor it has. */
+static inline int compat_open_overlapped_win(const char *path){
+    HANDLE h = CreateFileA(path, GENERIC_READ,
+                           FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    if(h == INVALID_HANDLE_VALUE) return -1;
+    int fd = _open_osfhandle((intptr_t)h, _O_RDONLY|_O_BINARY);
+    if(fd < 0){ CloseHandle(h); return -1; }
+    return fd;
+}
+#define compat_open_overlapped(path) compat_open_overlapped_win(path)
+
 /* --- dimensione file da fd: GetFileSizeEx ---
  * La lseek(SEEK_END) del CRT ritorna -1 sui fd NO_BUFFERING (misurato su
  * UCRT): la dimensione si chiede direttamente al kernel. Funziona su
@@ -417,6 +422,12 @@ static inline char *compat_mkdtemp(char *tmpl){
 #endif
 #ifndef COMPAT_O_BINARY
 #define COMPAT_O_BINARY 0
+#endif
+
+/* --- compat_open_overlapped altrove: una pread posizionale concorre gia',
+ * non serve un secondo descrittore --- */
+#ifndef compat_open_overlapped
+#define compat_open_overlapped(path) (-1)
 #endif
 
 /* --- read-only file mapping -------------------------------------------------
@@ -600,8 +611,10 @@ static inline void coli_hold_console(void)
 
 /* One wording for every engine: what this binary is, and the command that does
  * what the user was trying to do. Called on the "no model" exit path, which is
- * where a bare launch lands. `engine` is the family name for the message. */
-static inline void coli_print_launcher_help(const char *engine)
+ * where a bare launch lands. `engine` is the family name for the message,
+ * `by_hand` how this binary itself is run (they differ: some read the model
+ * from SNAP, some from their first argument; #1906). */
+static inline void coli_print_launcher_help(const char *engine, const char *by_hand)
 {
 #ifdef _WIN32
     const char *run = "coli.cmd";
@@ -618,11 +631,10 @@ static inline void coli_print_launcher_help(const char *engine)
         "    %s doctor --model <model directory>   check a model is usable\n"
         "\n"
         "The launcher needs Python 3 and picks the right engine for the model.\n"
-        "(Running the engine by hand: it reads the model directory from the\n"
-        "SNAP environment variable, e.g. SNAP=<model directory> ./%s ...)\n"
+        "(Running the engine by hand: %s)\n"
         "Getting a model, step by step: https://github.com/JustVugg/colibri"
         "/blob/main/docs/quickstart.md\n",
-        engine, run, run, run, run, engine);
+        engine, run, run, run, run, by_hand);
     coli_hold_console();
 }
 
@@ -707,5 +719,6 @@ static inline double compat_mem_available_gb(void){
     compat_meminfo_gb(NULL, &avail);
     return avail;
 }
+
 
 #endif /* COMPAT_H */

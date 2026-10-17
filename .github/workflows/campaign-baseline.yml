@@ -1,0 +1,31 @@
+name: Fork-only campaign dev baseline
+on:
+  push:
+    branches: [validation/colibri-dev-gate-20261017-root]
+permissions:
+  contents: read
+jobs:
+  baseline:
+    if: github.repository == 'rudycelekli/colibri'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 4149eb451669e9379b9df46dfb79f3d8bf3e5a82
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify source revision
+        run: test "$(git rev-parse HEAD)" = 4149eb451669e9379b9df46dfb79f3d8bf3e5a82
+      - name: Dependency-free full CPU gate
+        run: make -C c -j"$(nproc)" check
+      - name: Install pinned oracle dependencies
+        run: python -m pip install -r c/tools/requirements-glm53-tiny.txt
+      - name: Generate and enforce GLM comparisons
+        working-directory: c
+        run: |
+          python tools/make_glm_oracle.py
+          SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
+          SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
+          python tests/test_glm_oracle.py

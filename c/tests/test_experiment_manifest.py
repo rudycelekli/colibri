@@ -1,7 +1,14 @@
+import contextlib
 import copy
+import io
+import json
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
-from experiment_manifest import validate
+from experiment_manifest import main, validate
 
 
 def run(config, speeds):
@@ -61,6 +68,58 @@ class ExperimentManifestTest(unittest.TestCase):
         record["baseline"]["evidence"]["sha256"] = "unknown"
         with self.assertRaisesRegex(ValueError, "64 hex"):
             validate(record)
+
+    def test_rejects_a_document_that_is_not_an_object(self):
+        # A list, string, or null document escaped as AttributeError, which
+        # main() does not report by name.
+        for record in ([manifest()], "manifest", None):
+            with self.assertRaisesRegex(ValueError, "manifest must be an object"):
+                validate(record)
+
+    def test_cli_names_a_document_that_is_not_an_object(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            path.write_text("[]\n", encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = main([str(path)])
+        self.assertEqual(status, 1)
+        self.assertEqual(out.getvalue(), f"{path}: manifest must be an object\n")
+
+
+    def test_rejects_whitespace_inside_hash_identities(self):
+        for space in (" ", "\t", "\n"):
+            for field in ("commit", "baseline", "trial"):
+                with self.subTest(space=repr(space), field=field):
+                    record = manifest()
+                    if field == "commit":
+                        record[field] = "aa" + space * 38
+                    else:
+                        record[field]["evidence"]["sha256"] = "aa" + space * 62
+                    with self.assertRaisesRegex(ValueError, "hexadecimal"):
+                        validate(record)
+
+    def test_accepts_uppercase_hex_identities(self):
+        record = manifest()
+        record["commit"] = "AB" * 20
+        record["baseline"]["evidence"]["sha256"] = "CD" * 32
+        record["trial"]["evidence"]["sha256"] = "EF" * 32
+        validate(record)
+
+    def test_cli_rejects_malformed_hash_identity(self):
+        for field in ("commit", "baseline", "trial"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                record = manifest()
+                if field == "commit":
+                    record[field] = "aa" + " " * 38
+                else:
+                    record[field]["evidence"]["sha256"] = "aa" + " " * 62
+                path = Path(directory) / "manifest.json"
+                path.write_text(json.dumps(record), encoding="utf-8")
+                result = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve().parent.parent / "experiment_manifest.py"), str(path)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("hexadecimal", result.stdout)
+                self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

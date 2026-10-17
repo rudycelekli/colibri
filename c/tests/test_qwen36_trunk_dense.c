@@ -102,6 +102,7 @@ int main(void) {
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1);
     setenv("QT_NO_WARMSTART", "1", 1); setenv("HEAT_FILE", "", 1);
     setenv("COLI_PLACE", "", 1);                    /* "" == unset == auto */
+    setenv("Q36_OFFER_SHEXP", "1", 1);             /* the shared expert is offered on request only; this test is about the offer */
     setenv("CUDA_EXPERT_GB", "1", 1);               /* room for everything */
     unsetenv("COLI_DENSE_I8");
     /* the GEMV from VRAM is compared with the CPU's f32-activation kernel, the
@@ -135,9 +136,10 @@ int main(void) {
     ck(qt_place_of("dnout", 0) == 0 && qt_place_of("attnproj", 1) == 0 && qt_place_of("shexp", 0) == 0,
        "every offered component placed on the one device with room");
     ck(qt_place_of("shexp", 1) == QT_PLACE_CPU, "the component never offered stays on the CPU");
-    double vram = 0;
-    int placed = trunk_place_dense(&m, &vram);
+    double vram = 0; int kinds[3];
+    int placed = trunk_place_dense(&m, &vram, kinds);
     ck(placed == 8, "eight matrices placed: dnout, q k v o, and the complete shared expert");
+    ck(kinds[0] == 1 && kinds[1] == 4 && kinds[2] == 3, "counted by kind: 1 dnout, 4 attnproj, 3 shexp (#2082)");
     ck(vram == (double)(qdw_bytes(&dn->dn_out) + want_attn + qdw_bytes(&dn->sh_g) + qdw_bytes(&dn->sh_u) + qdw_bytes(&dn->sh_d)),
        "placed bytes are the sum of the dense-i8 copies uploaded");
     ck(fake_uploads == 8, "one upload per placed matrix");

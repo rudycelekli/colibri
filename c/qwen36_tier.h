@@ -24,11 +24,21 @@
 #ifdef COLI_CUDA
 
 /* Init after model load. Returns 1 when the tier is active.
- * cap_experts_per_layer must equal n_experts (full RAM residency): the tier
- * stores raw pointers into the expert slots, which must never be evicted. */
-/* expert_is_int4: 1 = pesi int4 impacchettati (fmt=4), 0 = int8 (fmt=1). Il
- * chiamante lo determina dalla TAGLIA SU DISCO, non da meta.ebits, che su
- * qualche container mente (cfr. il rilevamento in qwen36.c). */
+ * cap_experts_per_layer >= n_experts (full RAM residency): the tier keeps raw
+ * pointers into the expert slots, which are never evicted. Any smaller cap:
+ * copy mode, as for fp8 below -- the slots are recycled, so the tier copies an
+ * expert while the engine holds it (qt_note) and keeps no pointer
+ * (qt_streaming() says which). */
+/* expert_is_int4: 1 = pesi int4 impacchettati (fmt=4), 0 = int8 (fmt=1), -1 =
+ * no expert format the tier takes (the mixed layout): the devices hold the
+ * dense trunk only. Il chiamante lo determina dalla TAGLIA SU DISCO, non da
+ * meta.ebits, che su qualche container mente (cfr. il rilevamento in qwen36.c).
+ * The tier is also trunk-only for int8 experts with grouped scales and for
+ * COLI_PLACE experts=cpu; qt_experts_on() is 0 then. */
+/* Before qt_init: the int4 bytes qt_note hands over are expert_ffn.h's planar
+ * blocks (the engine's RAM layout when its shared kernel runs the CPU's
+ * experts), not the container's signed pairs; staging converts them. */
+void qt_source_planar(int on);
 /* R4 role split: park the dense-i8 lm_head on its own CUDA device
  * (COLI_LMHEAD_GPU=<dev>). One GEMV per token, at token end — outside the
  * per-layer latency chain — so a slower second card can host it without
@@ -80,6 +90,27 @@ int  qt_dnproj_init(int layer, const int8_t *q, const float *sc,
 int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O);
 int  qt_dnproj_ready(int layer);
 int  qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, int O);
+
+/* The whole DeltaNet layer on the device (backend coli_cuda_dn_*): after the
+ * input projection (qt_dnproj_init) and the out_proj (a qt_dense handle) have
+ * both landed on the same device, qt_dn_gpu_init puts the layer's conv ring,
+ * recurrent state and norm/conv weights there too; qt_dn_gpu_step then runs a
+ * decode token end to end on the card, host in, host out. The host copy of
+ * the state stays the engine's, moved with qt_dn_gpu_set/get_state whenever
+ * the CPU path (prefill, snapshot, reset) needs it. A failing step turns the
+ * layer off, like every other GPU path here, and the engine continues on the
+ * CPU from the state it can still get back. */
+int  qt_dn_gpu_init(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden,
+                    const float *conv_w, const float *norm_w, float eps, int dnout_handle_plus1);
+int  qt_dn_gpu_ready(int layer);
+/* the same from three dense handles (in_proj qkv, in_proj z, out_proj), all on one
+ * device -- qwen38's trunk items; gate_sigmoid: the gated norm's gate (1 = sigmoid(z)) */
+int  qt_dn_gpu_init_dense(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden,
+                          const float *conv_w, const float *norm_w, float eps, int gate_sigmoid,
+                          int proj_handle_plus1, int projz_handle_plus1, int dnout_handle_plus1);
+int  qt_dn_gpu_set_state(int layer, const float *ring, const float *rec);   /* NULL = zero */
+int  qt_dn_gpu_get_state(int layer, float *ring, float *rec);
+int  qt_dn_gpu_step(int layer, const float *x, float *out, const float *egh, const float *beta);
 /* Generic resident dense matrix (int8 per-row, one GEMV per call), addressed
  * by a handle: the Qwen3.8 trunk uses this for every matrix it places. Offer
  * the size with qt_trunk_offer(name, layer, bytes) before qt_init, ask
@@ -90,6 +121,11 @@ int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 /* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
 int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
 int  qt_dense_count(void);
+/* The resident tensors behind the handles, for the dense chain (qwen36_cuda_chain.h):
+ * the backend's object and the CUDA ordinal it lives on; NULL when nothing is placed. */
+struct ColiCudaTensor *qt_dense_tensor(int handle, int *dev);
+struct ColiCudaTensor *qt_dnproj_tensor(int layer, int *dev);
+struct ColiCudaTensor *qt_lmhead_tensor(int *dev);
 
 /* fp8 streaming mode (Qwen3.8): experts arrive as e4m3 bytes with 128x128
  * block scales and do NOT all fit in RAM. cap may be smaller than n_experts;
@@ -104,13 +140,17 @@ int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
 int  qt_ready(void);
+int  qt_streaming(void);   /* copy mode: no pointer into the engine's slots is kept */
+int  qt_experts_on(void);  /* some device has room for experts (not trunk-only) */
 int  qt_is_resident(int layer, int eid);
 void qt_shutdown(void);
 
-/* Call once per routed expert per token (pointers to the RAM slot: packed
- * int4 or, on an int8 container, the live int8 weights -- tier fmt=1 is
- * accepted since #1334; see also #1391 for the decode-path offer). Updates
- * heat and may enqueue a background upload. */
+/* Call for each routed expert the CPU computes (pointers to the RAM slot:
+ * packed int4, planar int4 after qt_source_planar(1), or, on an int8
+ * container, the live int8 weights -- tier fmt=1 is accepted since #1334; see
+ * also #1391 for the decode-path offer). Counts its heat (qt_issue counts the
+ * hits') and may enqueue a background upload; in copy mode the bytes are
+ * copied before this returns. */
 void qt_note(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
@@ -137,6 +177,27 @@ void qt_note_block(int layer, int eid,
              const float *gs, const float *us, const float *ds);
 void qt_fill_wait(void);   /* blocks until every enqueued upload is resident (not merely dequeued) */
 
+/* Re-plan the resident set from the prompt's own routing. counts[] are this
+ * prompt's routing counts per expert: for layer >= 0 one layer's ne counts
+ * (the engine calls this after each prefill layer's routing, so the swaps of
+ * layer L upload while layers L+1.. still compute), for layer < 0 the whole
+ * nl*ne table. Residents the prompt never routed to are swapped, budget-
+ * neutral, for the prompt's most-routed non-residents of the same layer (or
+ * device, for the whole-table form), through the victim-first swap the LFRU
+ * tick uses, while the newcomer's count strictly exceeds the victim's. As
+ * many swaps as the upload queue takes start at once, the rest are pending
+ * and drain on later calls and, a few per token, on the decode ticks: nothing
+ * blocks. Returns the pairs planned by this call. */
+int  qt_replan(int layer, const uint32_t *counts, int max_swaps);
+/* Experts the tier evicted since the last call (LFRU and re-plan swaps), as
+ * (layer, eid) pairs, oldest first; the engine rebuilds their CPU copies ahead
+ * of the miss path. Bounded ring: what overflows is simply not reported, the
+ * miss path rebuilds lazily as before. Returns the count written. */
+int  qt_evicted_take(int *layers, int *eids, int max);
+/* Snapshot the hit/miss counters; qt_stats then also reports the hit rate
+ * from this point on (the engine marks the prefill/decode boundary). */
+void qt_stats_mark(void);
+
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
 
@@ -155,11 +216,23 @@ static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dnproj_ready(int a){(void)a;return 0;}
 static inline int  qt_dnproj_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
+static inline int  qt_dn_gpu_init(int a,int b,int c,int d,int e,int f,int g,int i,const float*j,const float*k,float l,int m){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)i;(void)j;(void)k;(void)l;(void)m;return 0;}
+static inline int  qt_dn_gpu_ready(int a){(void)a;return 0;}
+static inline int  qt_dn_gpu_init_dense(int a,int b,int c,int d,int e,int f,int g,int i,const float*j,const float*k,float l,int m,int n,int o,int p){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)p;return 0;}
+static inline int  qt_dn_gpu_set_state(int a,const float*b,const float*c){(void)a;(void)b;(void)c;return 0;}
+static inline int  qt_dn_gpu_get_state(int a,float*b,float*c){(void)a;(void)b;(void)c;return 0;}
+static inline int  qt_dn_gpu_step(int a,const float*b,float*c,const float*d,const float*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_count(void){return 0;}
+static inline void *qt_dense_tensor(int a,int*b){(void)a;(void)b;return NULL;}
+static inline void *qt_dnproj_tensor(int a,int*b){(void)a;(void)b;return NULL;}
+static inline void *qt_lmhead_tensor(int*b){(void)b;return NULL;}
 static inline int  qt_ready(void){return 0;}
+static inline int  qt_streaming(void){return 0;}
+static inline int  qt_experts_on(void){return 0;}
+static inline void qt_source_planar(int a){(void)a;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
@@ -170,6 +243,9 @@ static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,c
 static inline int  qt_fill_next(int*a,int*b){(void)a;(void)b;return 0;}
 static inline void qt_note_block(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline void qt_fill_wait(void){}
+static inline int  qt_replan(int l,const uint32_t*a,int b){(void)l;(void)a;(void)b;return 0;}
+static inline int  qt_evicted_take(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
+static inline void qt_stats_mark(void){}
 static inline void qt_stats(void){}
 
 #endif /* COLI_CUDA */

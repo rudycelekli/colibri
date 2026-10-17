@@ -7,6 +7,30 @@
 #include <assert.h>
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <sys/wait.h>
+
+static void test_disconnected_peer_is_an_io_error(void)
+{
+    /* Use a child with the default signal disposition: a caller must receive
+     * the error, even when its launcher has not globally ignored SIGPIPE. */
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        close(sockets[1]);
+        signal(SIGPIPE, SIG_DFL);
+        char byte = 'x';
+        int result = cluster_io(sockets[0], &byte, 1, 1);
+        close(sockets[0]);
+        assert(signal(SIGPIPE, SIG_DFL) == SIG_DFL);
+        _exit(result == -1 ? 0 : 2);
+    }
+    int status;
+    while (waitpid(child, &status, 0) < 0) assert(errno == EINTR);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 typedef struct { int fd; int failed; } ClusterProtocolArgs;
 
 static void *cluster_protocol_worker(void *opaque)
@@ -83,12 +107,56 @@ static void test_wire_round_trip(void)
     close(sockets[0]);
     close(sockets[1]);
 }
+
+/* cluster_moe_batch on the coordinator's side of the same socketpair, against the
+ * worker above: the transfer counters advance by exactly the bytes that crossed the
+ * socket -- request 8 + 7*4 + 2*3*4 = 60 out, response 8 + 5*4 + 2*3*4 = 52 in --
+ * the wire time is > 0, and each row of `out` gets its weighted expert output. The
+ * worker thread's own cluster_io calls run in this same process and must NOT count:
+ * the counters are the coordinator's, and the raw round trip above moved nothing. */
+static void test_moe_batch_counts_the_wire(void)
+{
+    assert(atomic_load(&g_cluster_ns) == 0);
+    assert(atomic_load(&g_cluster_tx) == 0 && atomic_load(&g_cluster_rx) == 0);
+
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    ClusterProtocolArgs args = {sockets[1], 0};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, cluster_protocol_worker, &args) == 0);
+
+    Model *m = calloc(1, sizeof(Model));
+    assert(m != NULL);
+    m->c.hidden = 3; m->c.moe_inter = 5;
+    g_cluster_workers[0].fd = sockets[0]; g_cluster_n = 1;
+
+    /* two rows, both routed (K=1) to expert 42 of layer 7, weights 0.5 and 1.0 */
+    float x[6] = {1.0f, -2.0f, 0.5f, 3.0f, -4.0f, 0.25f}, out[6] = {0};
+    float ws[2] = {0.5f, 1.0f};
+    int idxs[2] = {42, 42}, keff[2] = {1, 1}, uniq[1] = {42};
+    cluster_moe_batch(m, 7, x, 2, out, idxs, ws, keff, 1, uniq, 0, 1);
+
+    assert(pthread_join(thread, NULL) == 0);
+    assert(args.failed == 0);
+    for (int r = 0; r < 2; r++)
+        for (int d = 0; d < 3; d++) assert(out[r * 3 + d] == ws[r] * 2.0f * x[r * 3 + d]);
+    assert(atomic_load(&g_cluster_tx) == 60);
+    assert(atomic_load(&g_cluster_rx) == 52);
+    assert(atomic_load(&g_cluster_ns) > 0);
+
+    g_cluster_n = 0; g_cluster_workers[0].fd = -1;
+    close(sockets[0]);
+    close(sockets[1]);
+    free(m);
+}
 #endif
 
 int main(void)
 {
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    test_disconnected_peer_is_an_io_error();
     test_wire_round_trip();
+    test_moe_batch_counts_the_wire();
     puts("cluster protocol tests: ok");
 #else
     puts("cluster protocol tests: skipped on Windows");
