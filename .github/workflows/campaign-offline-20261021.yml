@@ -29,7 +29,7 @@ jobs:
       CASE: ${{ matrix.label }}
       APP_SHA: ${{ matrix.sha }}
       BASE_SHA: ca0a503738131870c13dc92de6603dbf0be91037
-      EVIDENCE_DIR: ${{ runner.temp }}/colibri-offline-${{ matrix.label }}
+      EVIDENCE_DIR: /tmp/colibri-offline-${{ matrix.label }}
       PYTHONUTF8: '1'
       HF_HUB_OFFLINE: '1'
       TRANSFORMERS_OFFLINE: '1'
