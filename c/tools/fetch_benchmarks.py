@@ -8,11 +8,17 @@ USO:
 Poi:
   python3 tools/eval_glm.py --snap /path/to/glm52_i4 --data ./bench --tasks mmlu --limit 40 --ram 15
 """
-import os, sys, json, time, argparse, random
+import os, sys, json, time, argparse, random, re
+
+def hellaswag_text(text):
+    # Match the reference task's cleanup of WikiHow markup artifacts.
+    text = text.strip().replace(" [title]", ". ")
+    text = re.sub(r"\[.*?\]", "", text)
+    return text.replace("  ", " ")
 
 def f_hellaswag(d):
-    ctx = (d["activity_label"] + ": " + d["ctx_a"] + " " + d["ctx_b"].capitalize()).strip()
-    return ctx, [" " + e.strip() for e in d["endings"]], int(d["label"])
+    ctx = hellaswag_text(d["activity_label"] + ": " + d["ctx_a"] + " " + d["ctx_b"].capitalize())
+    return ctx, [" " + hellaswag_text(e) for e in d["endings"]], int(d["label"])
 def f_arc(d):
     letters, texts = d["choices"]["label"], d["choices"]["text"]
     return ("Question: " + d["question"].strip() + "\nAnswer:",
