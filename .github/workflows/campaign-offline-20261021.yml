@@ -1,0 +1,203 @@
+name: Fork-only Colibri independent native validation
+'on':
+  push:
+    branches:
+    - validation/colibri-offline-20261021
+permissions:
+  contents: read
+concurrency:
+  group: colibri-offline-20261021-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  native:
+    if: github.repository == 'rudycelekli/colibri'
+    name: '${{ matrix.label }}: exact product tree, full CPU gate, strict oracle'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+        - label: baseline
+          sha: ca0a503738131870c13dc92de6603dbf0be91037
+        - label: gateway
+          sha: a5f9d6202ab327ca52cf8a295fc4d6b1578b4062
+        - label: install
+          sha: 20951347cb2c4bd6964171f75332015810e33e0b
+    env:
+      CASE: ${{ matrix.label }}
+      APP_SHA: ${{ matrix.sha }}
+      BASE_SHA: ca0a503738131870c13dc92de6603dbf0be91037
+      EVIDENCE_DIR: ${{ runner.temp }}/colibri-offline-${{ matrix.label }}
+      PYTHONUTF8: '1'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: rudycelekli/colibri
+        ref: ${{ matrix.sha }}
+        fetch-depth: 1
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Verify exact independent product source and unchanged native tree
+      run: |-
+        python - <<'PY'
+        import os,subprocess,pathlib,hashlib,json
+        env=os.environ; app=env['APP_SHA']; base=env['BASE_SHA']; label=env['CASE']
+        assert app in {'ca0a503738131870c13dc92de6603dbf0be91037','a5f9d6202ab327ca52cf8a295fc4d6b1578b4062','20951347cb2c4bd6964171f75332015810e33e0b'}
+        assert base=='ca0a503738131870c13dc92de6603dbf0be91037'
+        subprocess.run(['git','fetch','--no-tags','--depth=1','https://github.com/rudycelekli/colibri.git',base],check=True)
+        def git(*args):return subprocess.check_output(['git',*args],text=True)
+        assert git('rev-parse','HEAD').strip()==app
+        subprocess.run(['git','diff','--exit-code'],check=True)
+        subprocess.run(['git','diff','--check',base,app],check=True)
+        expected={'baseline':set(),'gateway':{'c/coli','c/tests/test_coli_gateway_stream_completion.py'},'install':{'c/mcp_server.py','c/setup_flow.py','c/tests/test_mcp_install_admission.py','c/tests/test_mcp_server.py','c/tests/test_mcp_install_state_owner.py'}}
+        changed=set(git('diff','--name-only',base,app).splitlines())
+        assert changed==expected[label],changed
+        def native(sha):
+            rows=git('ls-tree','-r',sha).splitlines()
+            return [r for r in rows if pathlib.PurePosixPath(r.split('\t',1)[1]).suffix in ('.c','.h','.cu','.mm','.m','.cc') or pathlib.PurePosixPath(r.split('\t',1)[1]).name.startswith('Makefile')]
+        assert native(base)==native(app),'Native/build sources changed'
+        evidence=pathlib.Path(env['EVIDENCE_DIR']);evidence.mkdir(parents=True)
+        (evidence/'identity.json').write_text(json.dumps({'case':label,'base':base,'product_head':app,'product_tree':git('rev-parse','HEAD^{tree}').strip(),'workflow_head':env['GITHUB_SHA'],'native_tree_sha256':hashlib.sha256(('\n'.join(native(app))+'\n').encode()).hexdigest(),'changed_files':sorted(changed)},indent=2)+'\n')
+        PY
+    - name: Required full clean portable CPU build and C/Python suites
+      timeout-minutes: 45
+      run: |-
+        python - <<'PY'
+        import os,subprocess,pathlib,re,json,sys
+        evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);log=evidence/'make-check.log'
+        with log.open('w') as stream:
+            result=subprocess.run(['make','-C','c','-j2','check'],stdout=stream,stderr=subprocess.STDOUT)
+        output=log.read_text(errors='replace');lines=output.splitlines()
+        warnings=[line for line in lines if re.search(r'(^|:)\s*warning:',line)]
+        start=next((i for i,line in enumerate(lines) if line.strip().endswith('make portable')),None)
+        end=next((i for i,line in enumerate(lines) if start is not None and i>start and line.strip().endswith('make test')),None)
+        portable='\n'.join(lines[start:end]) if start is not None and end is not None else ''
+        (evidence/'production-portable-build.log').write_text('Exact phase excerpt from make-check.log, not a separate execution.\n'+portable+'\n')
+        production_clean=bool(portable) and not re.search(r'(^|:)\s*warning:',portable,re.M)
+        (evidence/'warning-audit.json').write_text(json.dumps({'make_check_exit':result.returncode,'production_portable_zero_warnings':production_clean,'all_fixture_warning_lines':warnings},indent=2)+'\n')
+        assert result.returncode==0,'Mandatory make check failed; see full log'
+        assert production_clean,'Production portable build missing or has warnings'
+        subprocess.run(['git','diff','--exit-code'],check=True)
+        PY
+    - name: Install locally validated CPU oracle package versions
+      timeout-minutes: 10
+      run: |-
+        python - <<'PY'
+        import os,subprocess,pathlib,json,importlib.metadata
+        evidence=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        commands=[['python','-m','pip','install','--index-url','https://download.pytorch.org/whl/cpu','torch==2.6.0'],['python','-m','pip','install','transformers==5.11.0','safetensors==0.7.0']]
+        with (evidence/'oracle-install.log').open('w') as stream:
+            for command in commands:
+                result=subprocess.run(command,stdout=stream,stderr=subprocess.STDOUT)
+                assert result.returncode==0,'Oracle dependency installation failed'
+        versions={name:importlib.metadata.version(name) for name in ('torch','transformers','safetensors','numpy','tokenizers','huggingface-hub')}
+        assert versions['torch'].split('+')[0]=='2.6.0' and versions['transformers']=='5.11.0'
+        (evidence/'oracle-versions.json').write_text(json.dumps(versions,indent=2)+'\n')
+        PY
+    - name: Generate offline host reference and enforce both strict GLM comparisons
+      timeout-minutes: 8
+      run: |-
+        python - <<'PY'
+        import os,subprocess,pathlib,json
+        evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);reference=pathlib.Path('c/ref_glm.json');original=reference.read_bytes()
+        commands=[('generation',['python','tools/make_glm_oracle.py'],{}),('tf',['./colibri','64','16','16'],{'SNAP':'./glm_tiny','TF':'1','COLI_TEMP':'0','ORACLE_STRICT':'1','ORACLE_TF_MAX_MISMATCHES':'2'}),('greedy',['./colibri','64','16','16'],{'SNAP':'./glm_tiny','COLI_TEMP':'0','ORACLE_STRICT':'1'}),('regressions',['python','tests/test_glm_oracle.py'],{})]
+        receipts=[]
+        try:
+            for name,command,extra in commands:
+                with (evidence/('oracle-'+name+'.log')).open('w') as stream:
+                    result=subprocess.run(command,cwd='c',env=dict(os.environ,OMP_NUM_THREADS='2',MKL_NUM_THREADS='2',**extra),stdout=stream,stderr=subprocess.STDOUT)
+                receipts.append({'case':name,'command':command,'environment':extra,'exit_code':result.returncode})
+                assert result.returncode==0,'Mandatory strict oracle failed: '+name
+            (evidence/'generated-reference.json').write_bytes(reference.read_bytes())
+        finally:
+            reference.write_bytes(original)
+            (evidence/'oracle-receipt.json').write_text(json.dumps(receipts,indent=2)+'\n')
+        subprocess.run(['git','diff','--exit-code'],check=True)
+        PY
+    - name: Native targeted failures on baseline and passing independent fixes
+      timeout-minutes: 5
+      run: |-
+        python - <<'PY'
+        import os,subprocess,pathlib,re,json
+        evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);label=os.environ['CASE'];receipts=[]
+        if label=='baseline':
+            sources=[('a5f9d6202ab327ca52cf8a295fc4d6b1578b4062','c/tests/test_coli_gateway_stream_completion.py','gateway-baseline',[],2),('20951347cb2c4bd6964171f75332015810e33e0b','c/tests/test_mcp_install_state_owner.py','install-baseline',['-k','child_completion'],1)]
+            for sha,name,case,extra,count in sources:
+                subprocess.run(['git','fetch','--no-tags','--depth=1','https://github.com/rudycelekli/colibri.git',sha],check=True)
+                target=pathlib.Path(name);assert not target.exists()
+                target.write_bytes(subprocess.check_output(['git','show',sha+':'+name]))
+                try:
+                    command=['python','-m','unittest','discover','-s','tests','-p',target.name,*extra]
+                    result=subprocess.run(command,cwd='c',stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+                    (evidence/(case+'.log')).write_text(result.stdout)
+                    assert result.returncode==1,result.stdout
+                    assert re.search(r'Ran '+str(count)+r' tests? in ',result.stdout),result.stdout
+                    assert 'FAILED (failures=1)' in result.stdout,result.stdout
+                    assert not re.search(r'^ERROR:',result.stdout,re.M),result.stdout
+                    receipts.append({'case':case,'command':command,'exit_code':result.returncode,'expected_failures':1})
+                finally:
+                    target.unlink(missing_ok=True)
+        else:
+            files={'gateway':['test_coli_gateway_stream_completion.py'],'install':['test_mcp_install_state_owner.py','test_mcp_install_admission.py','test_mcp_server.py']}[label]
+            for name in files:
+                command=['python','-m','unittest','discover','-s','tests','-p',name]
+                with (evidence/('focused-'+name+'.log')).open('w') as stream:
+                    result=subprocess.run(command,cwd='c',stdout=stream,stderr=subprocess.STDOUT)
+                receipts.append({'command':command,'exit_code':result.returncode})
+                assert result.returncode==0,name+' failed'
+        (evidence/'focused-receipt.json').write_text(json.dumps(receipts,indent=2)+'\n')
+        subprocess.run(['git','diff','--exit-code'],check=True)
+        PY
+    - name: Record final product identity and evidence checksums
+      if: always()
+      run: |-
+        python - <<'PY'
+        import os,subprocess,pathlib,hashlib,json
+        evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);evidence.mkdir(exist_ok=True,parents=True)
+        head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+        diff=subprocess.run(['git','diff','--exit-code'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+        (evidence/'final-tree.json').write_text(json.dumps({'expected_head':os.environ['APP_SHA'],'actual_head':head,'tracked_diff_exit':diff.returncode,'workflow_head':os.environ['GITHUB_SHA']},indent=2)+'\n')
+        def checksum(path):
+            digest=hashlib.sha256()
+            with path.open('rb') as stream:
+                for chunk in iter(lambda:stream.read(65536),b''):digest.update(chunk)
+            return digest.hexdigest()
+        hashes={p.name:checksum(p) for p in sorted(evidence.iterdir()) if p.is_file() and p.name!='checksums.json'}
+        (evidence/'checksums.json').write_text(json.dumps(hashes,indent=2)+'\n')
+        assert head==os.environ['APP_SHA'] and diff.returncode==0,'Tracked product tree changed'
+        PY
+    - name: Emit bounded evidence and checksums to ordinary job logs
+      if: always()
+      run: |-
+        python - <<'PY'
+        import os,pathlib,sys,uuid,hashlib
+        evidence=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        limit=4*1024*1024;remaining=limit
+        if not evidence.is_dir():
+            print('No evidence directory was created; an earlier setup step failed.')
+        else:
+            priority={'checksums.json':0,'identity.json':1,'final-tree.json':2,'warning-audit.json':3,'oracle-receipt.json':4,'focused-receipt.json':5}
+            for path in sorted(evidence.iterdir(),key=lambda p:(priority.get(p.name,10),p.name)):
+                if not path.is_file():continue
+                size=path.stat().st_size;digest=hashlib.sha256()
+                with path.open('rb') as stream:
+                    for chunk in iter(lambda:stream.read(65536),b''):digest.update(chunk)
+                with path.open('rb') as stream:shown=stream.read(remaining)
+                remaining-=len(shown)
+                print('::group::Evidence: '+path.name,flush=True)
+                print('bytes='+str(size)+' sha256='+digest.hexdigest()+' shown_bytes='+str(len(shown)),flush=True)
+                token=uuid.uuid4().hex
+                print('::stop-commands::'+token,flush=True)
+                sys.stdout.buffer.write(shown);sys.stdout.buffer.write(b'\n');sys.stdout.buffer.flush()
+                print('::'+token+'::',flush=True)
+                if len(shown)<size:print('TRUNCATED: shared 4 MiB job-log evidence cap reached; checksum covers full ephemeral file.',flush=True)
+                print('::endgroup::',flush=True)
+            print('Evidence byte cap='+str(limit)+' emitted_bytes='+str(limit-remaining),flush=True)
+        PY
