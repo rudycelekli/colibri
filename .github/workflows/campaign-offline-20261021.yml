@@ -19,12 +19,8 @@ jobs:
       max-parallel: 3
       matrix:
         include:
-        - label: baseline
-          sha: ca0a503738131870c13dc92de6603dbf0be91037
-        - label: gateway
-          sha: a5f9d6202ab327ca52cf8a295fc4d6b1578b4062
         - label: install
-          sha: 20951347cb2c4bd6964171f75332015810e33e0b
+          sha: 32dddf111f998e091b31be2c58d95daa5bb6f9ed
     env:
       CASE: ${{ matrix.label }}
       APP_SHA: ${{ matrix.sha }}
@@ -49,7 +45,7 @@ jobs:
         python - <<'PY'
         import os,subprocess,pathlib,hashlib,json
         env=os.environ; app=env['APP_SHA']; base=env['BASE_SHA']; label=env['CASE']
-        assert app in {'ca0a503738131870c13dc92de6603dbf0be91037','a5f9d6202ab327ca52cf8a295fc4d6b1578b4062','20951347cb2c4bd6964171f75332015810e33e0b'}
+        assert app in {'ca0a503738131870c13dc92de6603dbf0be91037','a5f9d6202ab327ca52cf8a295fc4d6b1578b4062','32dddf111f998e091b31be2c58d95daa5bb6f9ed'}
         assert base=='ca0a503738131870c13dc92de6603dbf0be91037'
         subprocess.run(['git','fetch','--no-tags','--depth=1','https://github.com/rudycelekli/colibri.git',base],check=True)
         def git(*args):return subprocess.check_output(['git',*args],text=True)
@@ -128,7 +124,7 @@ jobs:
         import os,subprocess,pathlib,re,json
         evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);label=os.environ['CASE'];receipts=[]
         if label=='baseline':
-            sources=[('a5f9d6202ab327ca52cf8a295fc4d6b1578b4062','c/tests/test_coli_gateway_stream_completion.py','gateway-baseline',[],2),('20951347cb2c4bd6964171f75332015810e33e0b','c/tests/test_mcp_install_state_owner.py','install-baseline',['-k','child_completion'],1)]
+            sources=[('a5f9d6202ab327ca52cf8a295fc4d6b1578b4062','c/tests/test_coli_gateway_stream_completion.py','gateway-baseline',[],2),('32dddf111f998e091b31be2c58d95daa5bb6f9ed','c/tests/test_mcp_install_state_owner.py','install-baseline',['-k','child_completion'],1)]
             for sha,name,case,extra,count in sources:
                 subprocess.run(['git','fetch','--no-tags','--depth=1','https://github.com/rudycelekli/colibri.git',sha],check=True)
                 target=pathlib.Path(name);assert not target.exists()
