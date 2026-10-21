@@ -12,12 +12,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 458b24d381686ee77bd469f99ad3cc9c5bf87959
+          ref: 2f65a8791931d962a799bbfc33610b72bfb2dc44
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
       - name: Verify exact combined source
-        run: test "$(git rev-parse HEAD)" = 458b24d381686ee77bd469f99ad3cc9c5bf87959
+        run: test "$(git rev-parse HEAD)" = 2f65a8791931d962a799bbfc33610b72bfb2dc44
       - name: Dependency-free full CPU gate
         run: make -C c -j"$(nproc)" check
       - name: Install pinned oracle dependencies
