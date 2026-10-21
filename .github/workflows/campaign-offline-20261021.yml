@@ -20,12 +20,12 @@ jobs:
       max-parallel: 3
       matrix:
         include:
-        - label: loading
-          sha: 653a12d953fd399d5e2d0facd6dcaff3b6044295
+        - label: port
+          sha: 97c290dae5a6101f0b448b89460d737a83e60dc0
     env:
       CASE: ${{ matrix.label }}
       APP_SHA: ${{ matrix.sha }}
-      BASE_SHA: ca0a503738131870c13dc92de6603dbf0be91037
+      BASE_SHA: 0a0f66b93465cc8fbb4b2f5e99a60f983346e9b8
       EVIDENCE_DIR: /tmp/colibri-offline-${{ matrix.label }}
       PYTHONUTF8: '1'
       HF_HUB_OFFLINE: '1'
@@ -45,23 +45,22 @@ jobs:
       run: |-
         python - <<'PY'
         import os,subprocess,pathlib,hashlib,json
-        env=os.environ; app=env['APP_SHA']; base=env['BASE_SHA']; label=env['CASE']
-        assert app in {'ca0a503738131870c13dc92de6603dbf0be91037','a5f9d6202ab327ca52cf8a295fc4d6b1578b4062','32dddf111f998e091b31be2c58d95daa5bb6f9ed','653a12d953fd399d5e2d0facd6dcaff3b6044295'}
-        assert base=='ca0a503738131870c13dc92de6603dbf0be91037'
+        app=os.environ['APP_SHA'];base=os.environ['BASE_SHA']
+        assert app=='97c290dae5a6101f0b448b89460d737a83e60dc0'
+        assert base=='0a0f66b93465cc8fbb4b2f5e99a60f983346e9b8'
         subprocess.run(['git','fetch','--no-tags','--depth=1','https://github.com/rudycelekli/colibri.git',base],check=True)
         def git(*args):return subprocess.check_output(['git',*args],text=True)
         assert git('rev-parse','HEAD').strip()==app
         subprocess.run(['git','diff','--exit-code'],check=True)
         subprocess.run(['git','diff','--check',base,app],check=True)
-        expected={'baseline':set(),'gateway':{'c/coli','c/tests/test_coli_gateway_stream_completion.py'},'install':{'c/mcp_server.py','c/setup_flow.py','c/tests/test_mcp_install_admission.py','c/tests/test_mcp_server.py','c/tests/test_mcp_install_state_owner.py'},'loading':{'c/coli','c/tests/test_coli_private_gateway_cleanup.py'}}
         changed=set(git('diff','--name-only',base,app).splitlines())
-        assert changed==expected[label],changed
+        assert changed=={'c/setup_flow.py','c/tests/test_setup_port_range.py'},changed
         def native(sha):
             rows=git('ls-tree','-r',sha).splitlines()
             return [r for r in rows if pathlib.PurePosixPath(r.split('\t',1)[1]).suffix in ('.c','.h','.cu','.mm','.m','.cc') or pathlib.PurePosixPath(r.split('\t',1)[1]).name.startswith('Makefile')]
         assert native(base)==native(app),'Native/build sources changed'
-        evidence=pathlib.Path(env['EVIDENCE_DIR']);evidence.mkdir(parents=True)
-        (evidence/'identity.json').write_text(json.dumps({'case':label,'base':base,'product_head':app,'product_tree':git('rev-parse','HEAD^{tree}').strip(),'workflow_head':env['GITHUB_SHA'],'native_tree_sha256':hashlib.sha256(('\n'.join(native(app))+'\n').encode()).hexdigest(),'changed_files':sorted(changed)},indent=2)+'\n')
+        evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);evidence.mkdir(parents=True)
+        (evidence/'identity.json').write_text(json.dumps({'case':'port','base':base,'product_head':app,'product_tree':git('rev-parse','HEAD^{tree}').strip(),'workflow_head':os.environ['GITHUB_SHA'],'native_tree_sha256':hashlib.sha256(('\n'.join(native(app))+'\n').encode()).hexdigest(),'changed_files':sorted(changed)},indent=2)+'\n')
         PY
     - name: Required full clean portable CPU build and C/Python suites
       timeout-minutes: 45
@@ -122,33 +121,18 @@ jobs:
       timeout-minutes: 5
       run: |-
         python - <<'PY'
-        import os,subprocess,pathlib,re,json
-        evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);label=os.environ['CASE'];receipts=[]
-        if label=='baseline':
-            sources=[('a5f9d6202ab327ca52cf8a295fc4d6b1578b4062','c/tests/test_coli_gateway_stream_completion.py','gateway-baseline',[],2),('32dddf111f998e091b31be2c58d95daa5bb6f9ed','c/tests/test_mcp_install_state_owner.py','install-baseline',['-k','child_completion'],1)]
-            for sha,name,case,extra,count in sources:
-                subprocess.run(['git','fetch','--no-tags','--depth=1','https://github.com/rudycelekli/colibri.git',sha],check=True)
-                target=pathlib.Path(name);assert not target.exists()
-                target.write_bytes(subprocess.check_output(['git','show',sha+':'+name]))
-                try:
-                    command=['python','-m','unittest','discover','-s','tests','-p',target.name,*extra]
-                    result=subprocess.run(command,cwd='c',stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
-                    (evidence/(case+'.log')).write_text(result.stdout)
-                    assert result.returncode==1,result.stdout
-                    assert re.search(r'Ran '+str(count)+r' tests? in ',result.stdout),result.stdout
-                    assert 'FAILED (failures=1)' in result.stdout,result.stdout
-                    assert not re.search(r'^ERROR:',result.stdout,re.M),result.stdout
-                    receipts.append({'case':case,'command':command,'exit_code':result.returncode,'expected_failures':1})
-                finally:
-                    target.unlink(missing_ok=True)
-        else:
-            files={'gateway':['test_coli_gateway_stream_completion.py'],'install':['test_mcp_install_state_owner.py','test_mcp_install_admission.py','test_mcp_server.py'],'loading':['test_coli_private_gateway_cleanup.py','test_launcher_dispatch.py','test_coli_run_olmoe_prompt.py','test_engine_close_drain.py']}[label]
-            for name in files:
-                command=['python','-m','unittest','discover','-s','tests','-p',name]
-                with (evidence/('focused-'+name+'.log')).open('w') as stream:
-                    result=subprocess.run(command,cwd='c',stdout=stream,stderr=subprocess.STDOUT)
-                receipts.append({'command':command,'exit_code':result.returncode})
-                assert result.returncode==0,name+' failed'
+        import os,subprocess,pathlib,json,re
+        evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);receipts=[]
+        for name in ('test_setup_port_range.py','test_setup_flow.py'):
+            command=['python','-m','unittest','discover','-s','tests','-p',name,'-v']
+            result=subprocess.run(command,cwd='c',capture_output=True,text=True)
+            output=result.stdout+result.stderr
+            (evidence/('focused-'+name+'.log')).write_text(output)
+            receipts.append({'command':command,'exit_code':result.returncode})
+            assert result.returncode==0,output
+            if name=='test_setup_port_range.py':
+                assert re.search(r'Ran 5 tests in ',output),output
+                assert not re.search(r'\bskipped\b',output,re.I),output
         (evidence/'focused-receipt.json').write_text(json.dumps(receipts,indent=2)+'\n')
         subprocess.run(['git','diff','--exit-code'],check=True)
         PY
