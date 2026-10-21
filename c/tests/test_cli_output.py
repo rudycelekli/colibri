@@ -193,6 +193,7 @@ class ChatCapForwardingTest(unittest.TestCase):
              mock.patch.object(coli, "env_for_engine", return_value={}), \
              mock.patch.object(coli, "server_probe", return_value="inkling-colibri"), \
              mock.patch.object(coli, "chat_attached"), \
+             mock.patch.object(coli, "stop_private_gateway"), \
              mock.patch.object(coli, "Spinner", FakeSpinner), \
              mock.patch("subprocess.Popen", FakeProc):
             coli.cmd_chat(args)
