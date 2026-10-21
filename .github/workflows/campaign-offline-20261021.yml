@@ -20,12 +20,16 @@ jobs:
       max-parallel: 3
       matrix:
         include:
-        - label: port
-          sha: 97c290dae5a6101f0b448b89460d737a83e60dc0
+        - label: loading
+          sha: 7c4ea18a193d84c5b0a36909764e5265e356760a
+          base: ca0a503738131870c13dc92de6603dbf0be91037
+        - label: hellaswag
+          sha: 8744083784fde94bf13c4cc55ca1daf041894be2
+          base: 0a0f66b93465cc8fbb4b2f5e99a60f983346e9b8
     env:
       CASE: ${{ matrix.label }}
       APP_SHA: ${{ matrix.sha }}
-      BASE_SHA: 0a0f66b93465cc8fbb4b2f5e99a60f983346e9b8
+      BASE_SHA: ${{ matrix.base }}
       EVIDENCE_DIR: /tmp/colibri-offline-${{ matrix.label }}
       PYTHONUTF8: '1'
       HF_HUB_OFFLINE: '1'
@@ -45,22 +49,22 @@ jobs:
       run: |-
         python - <<'PY'
         import os,subprocess,pathlib,hashlib,json
-        app=os.environ['APP_SHA'];base=os.environ['BASE_SHA']
-        assert app=='97c290dae5a6101f0b448b89460d737a83e60dc0'
-        assert base=='0a0f66b93465cc8fbb4b2f5e99a60f983346e9b8'
+        app=os.environ['APP_SHA'];base=os.environ['BASE_SHA'];label=os.environ['CASE']
+        expected={'loading':('7c4ea18a193d84c5b0a36909764e5265e356760a','ca0a503738131870c13dc92de6603dbf0be91037',{'c/coli','c/tests/test_coli_private_gateway_cleanup.py','c/tests/test_cli_output.py'}),'hellaswag':('8744083784fde94bf13c4cc55ca1daf041894be2','0a0f66b93465cc8fbb4b2f5e99a60f983346e9b8',{'c/tools/fetch_benchmarks.py','c/tests/test_hellaswag_formatter.py'})}
+        assert (app,base)==expected[label][:2]
         subprocess.run(['git','fetch','--no-tags','--depth=1','https://github.com/rudycelekli/colibri.git',base],check=True)
         def git(*args):return subprocess.check_output(['git',*args],text=True)
         assert git('rev-parse','HEAD').strip()==app
         subprocess.run(['git','diff','--exit-code'],check=True)
         subprocess.run(['git','diff','--check',base,app],check=True)
         changed=set(git('diff','--name-only',base,app).splitlines())
-        assert changed=={'c/setup_flow.py','c/tests/test_setup_port_range.py'},changed
+        assert changed==expected[label][2],changed
         def native(sha):
             rows=git('ls-tree','-r',sha).splitlines()
             return [r for r in rows if pathlib.PurePosixPath(r.split('\t',1)[1]).suffix in ('.c','.h','.cu','.mm','.m','.cc') or pathlib.PurePosixPath(r.split('\t',1)[1]).name.startswith('Makefile')]
         assert native(base)==native(app),'Native/build sources changed'
         evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);evidence.mkdir(parents=True)
-        (evidence/'identity.json').write_text(json.dumps({'case':'port','base':base,'product_head':app,'product_tree':git('rev-parse','HEAD^{tree}').strip(),'workflow_head':os.environ['GITHUB_SHA'],'native_tree_sha256':hashlib.sha256(('\n'.join(native(app))+'\n').encode()).hexdigest(),'changed_files':sorted(changed)},indent=2)+'\n')
+        (evidence/'identity.json').write_text(json.dumps({'case':label,'base':base,'product_head':app,'product_tree':git('rev-parse','HEAD^{tree}').strip(),'workflow_head':os.environ['GITHUB_SHA'],'native_tree_sha256':hashlib.sha256(('\n'.join(native(app))+'\n').encode()).hexdigest(),'changed_files':sorted(changed)},indent=2)+'\n')
         PY
     - name: Required full clean portable CPU build and C/Python suites
       timeout-minutes: 45
@@ -122,16 +126,18 @@ jobs:
       run: |-
         python - <<'PY'
         import os,subprocess,pathlib,json,re
-        evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);receipts=[]
-        for name in ('test_setup_port_range.py','test_setup_flow.py'):
+        evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);receipts=[];label=os.environ['CASE']
+        files={'loading':('test_coli_private_gateway_cleanup.py','test_cli_output.py','test_launcher_dispatch.py','test_coli_run_olmoe_prompt.py','test_engine_close_drain.py'),'hellaswag':('test_hellaswag_formatter.py','test_fetch_benchmarks.py')}
+        for name in files[label]:
             command=['python','-m','unittest','discover','-s','tests','-p',name,'-v']
             result=subprocess.run(command,cwd='c',capture_output=True,text=True)
             output=result.stdout+result.stderr
             (evidence/('focused-'+name+'.log')).write_text(output)
             receipts.append({'command':command,'exit_code':result.returncode})
             assert result.returncode==0,output
-            if name=='test_setup_port_range.py':
-                assert re.search(r'Ran 5 tests in ',output),output
+            counts={'test_coli_private_gateway_cleanup.py':4,'test_hellaswag_formatter.py':3}
+            if name in counts:
+                assert re.search(r'Ran '+str(counts[name])+r' tests in ',output),output
                 assert not re.search(r'\bskipped\b',output,re.I),output
         (evidence/'focused-receipt.json').write_text(json.dumps(receipts,indent=2)+'\n')
         subprocess.run(['git','diff','--exit-code'],check=True)
