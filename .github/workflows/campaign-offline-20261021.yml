@@ -8,6 +8,7 @@ permissions:
 concurrency:
   group: colibri-offline-20261021-${{ github.ref }}
   cancel-in-progress: false
+  queue: max
 jobs:
   native:
     if: github.repository == 'rudycelekli/colibri'
@@ -19,8 +20,8 @@ jobs:
       max-parallel: 3
       matrix:
         include:
-        - label: install
-          sha: 32dddf111f998e091b31be2c58d95daa5bb6f9ed
+        - label: loading
+          sha: 653a12d953fd399d5e2d0facd6dcaff3b6044295
     env:
       CASE: ${{ matrix.label }}
       APP_SHA: ${{ matrix.sha }}
@@ -45,14 +46,14 @@ jobs:
         python - <<'PY'
         import os,subprocess,pathlib,hashlib,json
         env=os.environ; app=env['APP_SHA']; base=env['BASE_SHA']; label=env['CASE']
-        assert app in {'ca0a503738131870c13dc92de6603dbf0be91037','a5f9d6202ab327ca52cf8a295fc4d6b1578b4062','32dddf111f998e091b31be2c58d95daa5bb6f9ed'}
+        assert app in {'ca0a503738131870c13dc92de6603dbf0be91037','a5f9d6202ab327ca52cf8a295fc4d6b1578b4062','32dddf111f998e091b31be2c58d95daa5bb6f9ed','653a12d953fd399d5e2d0facd6dcaff3b6044295'}
         assert base=='ca0a503738131870c13dc92de6603dbf0be91037'
         subprocess.run(['git','fetch','--no-tags','--depth=1','https://github.com/rudycelekli/colibri.git',base],check=True)
         def git(*args):return subprocess.check_output(['git',*args],text=True)
         assert git('rev-parse','HEAD').strip()==app
         subprocess.run(['git','diff','--exit-code'],check=True)
         subprocess.run(['git','diff','--check',base,app],check=True)
-        expected={'baseline':set(),'gateway':{'c/coli','c/tests/test_coli_gateway_stream_completion.py'},'install':{'c/mcp_server.py','c/setup_flow.py','c/tests/test_mcp_install_admission.py','c/tests/test_mcp_server.py','c/tests/test_mcp_install_state_owner.py'}}
+        expected={'baseline':set(),'gateway':{'c/coli','c/tests/test_coli_gateway_stream_completion.py'},'install':{'c/mcp_server.py','c/setup_flow.py','c/tests/test_mcp_install_admission.py','c/tests/test_mcp_server.py','c/tests/test_mcp_install_state_owner.py'},'loading':{'c/coli','c/tests/test_coli_private_gateway_cleanup.py'}}
         changed=set(git('diff','--name-only',base,app).splitlines())
         assert changed==expected[label],changed
         def native(sha):
@@ -141,7 +142,7 @@ jobs:
                 finally:
                     target.unlink(missing_ok=True)
         else:
-            files={'gateway':['test_coli_gateway_stream_completion.py'],'install':['test_mcp_install_state_owner.py','test_mcp_install_admission.py','test_mcp_server.py']}[label]
+            files={'gateway':['test_coli_gateway_stream_completion.py'],'install':['test_mcp_install_state_owner.py','test_mcp_install_admission.py','test_mcp_server.py'],'loading':['test_coli_private_gateway_cleanup.py','test_launcher_dispatch.py','test_coli_run_olmoe_prompt.py','test_engine_close_drain.py']}[label]
             for name in files:
                 command=['python','-m','unittest','discover','-s','tests','-p',name]
                 with (evidence/('focused-'+name+'.log')).open('w') as stream:
