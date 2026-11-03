@@ -1,0 +1,43 @@
+name: Campaign owned gateway native Linux fixed
+on:
+  push:
+    branches: [verify/ui-owned-gateway-zombie-fixed-20261102]
+permissions:
+  contents: read
+jobs:
+  linux-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Native fixed controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          git rev-parse HEAD | tee validation/source-head.txt
+          python3 --version | tee validation/python-version.txt
+          test "$(git hash-object ui/models.py)" = 315cd788bca258b63fec7c8f66f05a9e6753d652
+          timeout 100s env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=c/tests:c python3 -m unittest test_ui_owned_gateway_process -v 2>&1 | tee validation/native-fixed.log
+          grep -Eq '^Ran 6 tests in [0-9.]+s$' validation/native-fixed.log
+          grep -Fxq 'OK' validation/native-fixed.log
+          if grep -Eq '^FAILED|^ERROR:|^OK \(skipped=|[.][.][.] skipped' validation/native-fixed.log; then exit 1; fi
+      - name: Private exact snapshot composition controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .campaign-validation/composed-models.py ui/models.py
+          cp .campaign-validation/test_ui_model_switch.py c/tests/test_ui_model_switch.py
+          git hash-object ui/models.py | tee validation/composed-models-blob.txt
+          timeout 65s env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=c/tests:c python3 -m unittest test_ui_model_switch -v 2>&1 | tee validation/native-snapshot-composition.log
+          grep -Eq '^Ran 6 tests in [0-9.]+s$' validation/native-snapshot-composition.log
+          grep -Fxq 'OK' validation/native-snapshot-composition.log
+          if grep -Eq '^FAILED|^ERROR:|^OK \(skipped=|[.][.][.] skipped' validation/native-snapshot-composition.log; then exit 1; fi
+      - name: Preserve actual native result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: owned-gateway-zombie-fixed-${{ github.sha }}
+          path: validation/
