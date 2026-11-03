@@ -1,0 +1,44 @@
+name: Campaign owned gateway native Linux baseline
+on:
+  push:
+    branches: [verify/ui-owned-gateway-zombie-baseline-20261102]
+permissions:
+  contents: read
+jobs:
+  linux-negative-witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Qualify unchanged-source native zombie witness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          git rev-parse HEAD | tee validation/source-head.txt
+          python3 --version | tee validation/python-version.txt
+          test "$(git hash-object ui/models.py)" = e1dbd6223aab9ed10eb1ae26832d5e9ff0f5e324
+          set +e
+          timeout 25s env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=c/tests:c python3 -m unittest test_ui_owned_gateway_process -v 2>&1 | tee validation/native.log
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          printf '%s\n' "${pipeline_status[0]}" > validation/test-exit-code.txt
+          test "${pipeline_status[1]}" -eq 0
+          test "${pipeline_status[0]}" -eq 1
+          grep -Fq 'Ran 1 test' validation/native.log
+          grep -Fq 'FAILED (failures=1)' validation/native.log
+          grep -Fq 'stop_gateway still waits although its owned child is a native zombie' validation/native.log
+          grep -Fq '"state": "Z"' validation/native.log
+          grep -Fq '"stop_completed": false' validation/native.log
+          grep -Fq '"signals": [15]' validation/native.log
+          grep -Fq '"errors": []' validation/native.log
+          grep -Fq 'OWNED_GATEWAY_CLEANUP complete' validation/native.log
+          printf 'Native owned zombie and pending stop observed before cleanup; expected-negative guard passed.\n' | tee validation/negative-witness.txt
+      - name: Preserve actual native result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: owned-gateway-zombie-baseline-${{ github.sha }}
+          path: validation/
